@@ -585,7 +585,7 @@ def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataF
     feat["Wave0_Flag"] = df.get("Wave0", pd.Series(False, index=df.index)).astype(int)
     feat["Wave5_Flag"] = df.get("Wave5", pd.Series(False, index=df.index)).astype(int)
 
-    # ---------- NEW: Long-term high/low features ----------
+    # ---------- Long-term high/low features ----------
     L1, L2 = get_longterm_windows(timeframe)
     close = df["Close"]
 
@@ -599,23 +599,23 @@ def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataF
     feat["Dist_L2_High"] = (close - high_L2) / high_L2.replace(0, np.nan)
     feat["Dist_L2_Low"]  = (close - low_L2) / low_L2.replace(0, np.nan)
 
-    # Label with future returns (different horizon per timeframe)
+    # ---------- Sharper label rules (only strong moves) ----------
     if timeframe == "1d":
-        horizon = 10      # ~2 weeks
-        thr_buy = 0.05    # +5%
-        thr_sell = -0.05  # -5%
+        horizon = 10       # ~2 weeks
+        thr_buy = 0.08     # +8% → strong up move
+        thr_sell = -0.06   # -6% → strong down move
     elif timeframe == "1wk":
-        horizon = 4       # ~1 month
-        thr_buy = 0.08    # +8%
-        thr_sell = -0.08  # -8%
+        horizon = 4        # ~1 month
+        thr_buy = 0.15     # +15%
+        thr_sell = -0.10   # -10%
     elif timeframe == "1h":
-        horizon = 24      # ~1 week of trading hours
-        thr_buy = 0.02    # +2%
-        thr_sell = -0.02  # -2%
+        horizon = 24       # ~1 week of trading hours
+        thr_buy = 0.03     # +3%
+        thr_sell = -0.025  # -2.5%
     else:
         horizon = 10
-        thr_buy = 0.05
-        thr_sell = -0.05
+        thr_buy = 0.08
+        thr_sell = -0.06
 
     feat["FutureRet"] = df["Close"].shift(-horizon) / df["Close"] - 1.0
 
@@ -653,9 +653,10 @@ def train_ml_model(df_all: pd.DataFrame, feature_cols: list):
     )
 
     clf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=6,
-        class_weight="balanced_subsample",
+        n_estimators=400,      # more trees
+        max_depth=None,        # deeper trees (more decisive)
+        min_samples_leaf=5,    # avoid crazy overfit
+        class_weight=None,     # let data decide class balance
         random_state=42,
     )
     clf.fit(X_train, y_train)
@@ -945,6 +946,36 @@ with tabs[3]:
                         break
                 if sort_col is not None:
                     merged = merged.sort_values(sort_col, ascending=False, na_position="last")
+
+                # ---------- NEW: Text signal based on probabilities ----------
+                def classify_signal(row):
+                    # Prefer weekly > daily > hourly for naming
+                    p_buy = row.get("P_Buy_Weekly", np.nan)
+                    p_sell = row.get("P_Sell_Weekly", np.nan)
+
+                    if np.isnan(p_buy) or np.isnan(p_sell):
+                        p_buy = row.get("P_Buy_Daily", np.nan)
+                        p_sell = row.get("P_Sell_Daily", np.nan)
+
+                    if np.isnan(p_buy) or np.isnan(p_sell):
+                        p_buy = row.get("P_Buy_Hourly", np.nan)
+                        p_sell = row.get("P_Sell_Hourly", np.nan)
+
+                    if np.isnan(p_buy) or np.isnan(p_sell):
+                        return "No signal"
+
+                    # Strong thresholds
+                    if p_buy >= 0.65 and p_sell <= 0.20:
+                        return "🚀 Strong Buy"
+                    if p_sell >= 0.65 and p_buy <= 0.20:
+                        return "⚠️ Strong Sell"
+                    if p_buy >= 0.55 and p_sell <= 0.30:
+                        return "👍 Weak Buy"
+                    if p_sell >= 0.55 and p_buy <= 0.30:
+                        return "👎 Weak Sell"
+                    return "😐 Hold / Neutral"
+
+                merged["Signal"] = merged.apply(classify_signal, axis=1)
 
                 st.subheader("📋 Buy/Sell Probabilities per Ticker")
                 fmt = {}
