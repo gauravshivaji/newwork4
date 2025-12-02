@@ -778,7 +778,7 @@ if st.session_state.analysis_run:
         st.download_button(
             f"📥 Download Rule-based Results (snapshot, {timeframe_choice})",
             preds_rule.to_csv(index=False).encode(),
-            f'nifty500_rule_signals_{interval}.csv",
+            f"nifty500_rule_signals_{interval}.csv",
             "text/csv",
         )
 
