@@ -710,7 +710,15 @@ if st.session_state.analysis_run:
                     def tradingview_link(ticker):
                         return f"https://in.tradingview.com/chart/?symbol=NSE%3A{ticker.replace('.NS','')}"
                     ml_df["TradingView"] = ml_df["Ticker"].apply(tradingview_link)
+                    # merge current price
+                    price_data = feats[['Ticker','Close']]
+                    ml_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
 
+# move price column after ticker
+                    cols = ["Ticker","Close"] + [col for col in ml_df.columns if col not in ["Ticker","Close"]]
+                    ml_df = ml_df[cols]
+
+                    
                     st.dataframe(
                         ml_df,
                         use_container_width=True,
