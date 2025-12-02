@@ -34,8 +34,8 @@ def load_data(ticker, period, interval):
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # SMAs
-    for win in [20, 50, 200]:
+    # SMAs (added 22 as per your rule)
+    for win in [20, 22, 50, 200]:
         df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
 
     # RSI(14)
@@ -469,7 +469,7 @@ def plot_chart(df: pd.DataFrame, title: str):
         col=1,
     )
 
-    # SMAs
+    # SMAs (still plotting 20/50/200 for clarity)
     for s in [20, 50, 200]:
         col = f"SMA_{s}"
         if col in df.columns:
@@ -550,33 +550,138 @@ def plot_chart(df: pd.DataFrame, title: str):
 
 
 # ----------------------------------------------------------
+# ------------- RULE-BASED LABEL (YOUR LOGIC) --------------
+# ----------------------------------------------------------
+def rule_based_label(row, timeframe: str) -> int:
+    """
+    Your rules:
+
+    BUY (2):
+      - price < SMA22 < SMA50 < SMA200 (we approximate via Dist_SMA_x < 0)
+      - RSI oversold
+      - bullish divergence
+      - price near good support
+      - Elliott phase ~ 0/2/4 (use Wave0 or bullish divergence)
+
+    SELL (0):
+      - price > SMA22 > SMA50 > SMA200
+      - RSI overbought
+      - bearish divergence
+      - price near resistance
+      - Elliott phase ~ 1/3/5 (use Wave5 or bearish divergence)
+
+    HOLD (1) otherwise.
+    """
+
+    rsi = row["RSI_14"]
+    d22 = row["Dist_SMA_22"]
+    d50 = row["Dist_SMA_50"]
+    d200 = row["Dist_SMA_200"]
+
+    wave0 = row["Wave0_Flag"]
+    wave5 = row["Wave5_Flag"]
+    bull_div = bool(row["BullDiv"])
+    bear_div = bool(row["BearDiv"])
+
+    dist_l1_low = row["Dist_L1_Low"]
+    dist_l1_high = row["Dist_L1_High"]
+
+    # ---------- BUY RULES ----------
+    # Price below all SMAs (approx for price < SMA22 < SMA50 < SMA200)
+    buy_price_ma = (d22 < 0) and (d50 < 0) and (d200 < 0)
+
+    # RSI oversold-ish
+    buy_rsi = (rsi <= 35)
+
+    # Good support: close near long-term low (0% to +10% above L1 low)
+    support_ok = (0.0 <= dist_l1_low <= 0.10)
+
+    # Elliott phase ~ 0/2/4
+    elliott_buy_ok = (wave0 == 1) or (bull_div and wave5 == 0)
+
+    if buy_price_ma and buy_rsi and bull_div and support_ok and elliott_buy_ok:
+        return 2  # BUY
+
+    # ---------- SELL RULES ----------
+    # Price above all SMAs (approx for price > SMA22 > SMA50 > SMA200)
+    sell_price_ma = (d22 > 0) and (d50 > 0) and (d200 > 0)
+
+    # RSI overbought-ish
+    sell_rsi = (rsi >= 65)
+
+    # Near resistance: close near long-term high (-5% to 0% below L1 high)
+    resistance_ok = (-0.05 <= dist_l1_high <= 0.0)
+
+    # Elliott phase ~ 1/3/5
+    elliott_sell_ok = (wave5 == 1) or (bear_div and wave0 == 0)
+
+    if sell_price_ma and sell_rsi and bear_div and resistance_ok and elliott_sell_ok:
+        return 0  # SELL
+
+    # ---------- OTHERWISE HOLD ----------
+    return 1  # HOLD / NEUTRAL
+
+
+# ----------------------------------------------------------
 # ----------------- ML FEATURE BUILDER ----------------------
 # ----------------------------------------------------------
 def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataFrame:
     """
-    Build ML-ready features + label for one ticker & timeframe.
+    Build ML-ready features + YOUR rule-based label for one ticker & timeframe.
     Label:
-        0 = Sell (future return <= -threshold)
+        0 = Sell (your conditions)
         1 = Hold
-        2 = Buy  (future return >= +threshold)
+        2 = Buy  (your conditions)
     """
     df = df.copy()
 
-    # Basic features
+    # ---------- Compute divergences using pivots ----------
+    params = get_params(timeframe)
+    k = params["pivot_k"]
+
+    n = len(df)
+    rsi = df["RSI_14"].values
+    close = df["Close"].values
+
+    piv_l = pivot_lows(df, k)
+    piv_h = pivot_highs(df, k)
+
+    bull_div = np.zeros(n, dtype=bool)
+    bear_div = np.zeros(n, dtype=bool)
+
+    # Bullish divergence: price lower low, RSI higher low
+    last_low_idx = None
+    for i in range(n):
+        if piv_l[i] and not np.isnan(rsi[i]):
+            if last_low_idx is not None and not np.isnan(rsi[last_low_idx]):
+                if close[i] < close[last_low_idx] and rsi[i] > rsi[last_low_idx]:
+                    bull_div[i] = True
+            last_low_idx = i
+
+    # Bearish divergence: price higher high, RSI lower high
+    last_high_idx = None
+    for i in range(n):
+        if piv_h[i] and not np.isnan(rsi[i]):
+            if last_high_idx is not None and not np.isnan(rsi[last_high_idx]):
+                if close[i] > close[last_high_idx] and rsi[i] < rsi[last_high_idx]:
+                    bear_div[i] = True
+            last_high_idx = i
+
+    # ---------- Basic feature frame ----------
     feat = pd.DataFrame(index=df.index)
     feat["Ticker"] = ticker
     feat["Close"] = df["Close"]
     feat["RSI_14"] = df["RSI_14"]
 
-    # Distances to SMA
-    for s in [20, 50, 200]:
+    # Distances to SMA (22, 50, 200)
+    for s in [22, 50, 200]:
         col = f"SMA_{s}"
         if col in df.columns:
             feat[f"Dist_SMA_{s}"] = (df["Close"] - df[col]) / df[col]
         else:
             feat[f"Dist_SMA_{s}"] = np.nan
 
-    # Returns (candle-based: for daily = days, weekly = weeks, hourly = hours)
+    # Short-term returns as extra features
     feat["Ret_3"] = df["Close"].pct_change(3)
     feat["Ret_5"] = df["Close"].pct_change(5)
     feat["Ret_10"] = df["Close"].pct_change(10)
@@ -585,54 +690,32 @@ def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataF
     feat["Wave0_Flag"] = df.get("Wave0", pd.Series(False, index=df.index)).astype(int)
     feat["Wave5_Flag"] = df.get("Wave5", pd.Series(False, index=df.index)).astype(int)
 
+    # Divergence flags
+    feat["BullDiv"] = bull_div
+    feat["BearDiv"] = bear_div
+
     # ---------- Long-term high/low features ----------
     L1, L2 = get_longterm_windows(timeframe)
-    close = df["Close"]
+    close_ser = df["Close"]
 
-    high_L1 = close.rolling(L1, min_periods=1).max()
-    low_L1  = close.rolling(L1, min_periods=1).min()
-    high_L2 = close.rolling(L2, min_periods=1).max()
-    low_L2  = close.rolling(L2, min_periods=1).min()
+    high_L1 = close_ser.rolling(L1, min_periods=1).max()
+    low_L1 = close_ser.rolling(L1, min_periods=1).min()
+    high_L2 = close_ser.rolling(L2, min_periods=1).max()
+    low_L2 = close_ser.rolling(L2, min_periods=1).min()
 
-    feat["Dist_L1_High"] = (close - high_L1) / high_L1.replace(0, np.nan)
-    feat["Dist_L1_Low"]  = (close - low_L1) / low_L1.replace(0, np.nan)
-    feat["Dist_L2_High"] = (close - high_L2) / high_L2.replace(0, np.nan)
-    feat["Dist_L2_Low"]  = (close - low_L2) / low_L2.replace(0, np.nan)
+    feat["Dist_L1_High"] = (close_ser - high_L1) / high_L1.replace(0, np.nan)
+    feat["Dist_L1_Low"] = (close_ser - low_L1) / low_L1.replace(0, np.nan)
+    feat["Dist_L2_High"] = (close_ser - high_L2) / high_L2.replace(0, np.nan)
+    feat["Dist_L2_Low"] = (close_ser - low_L2) / low_L2.replace(0, np.nan)
 
-    # ---------- Sharper label rules (only strong moves) ----------
-    if timeframe == "1d":
-        horizon = 10       # ~2 weeks
-        thr_buy = 0.08     # +8% → strong up move
-        thr_sell = -0.06   # -6% → strong down move
-    elif timeframe == "1wk":
-        horizon = 4        # ~1 month
-        thr_buy = 0.15     # +15%
-        thr_sell = -0.10   # -10%
-    elif timeframe == "1h":
-        horizon = 24       # ~1 week of trading hours
-        thr_buy = 0.03     # +3%
-        thr_sell = -0.025  # -2.5%
-    else:
-        horizon = 10
-        thr_buy = 0.08
-        thr_sell = -0.06
+    # ---------- Apply your rule-based labels ----------
+    # Drop rows where core indicators missing
+    feat = feat.dropna(subset=["RSI_14", "Close", "Dist_SMA_22", "Dist_SMA_50", "Dist_SMA_200"])
 
-    feat["FutureRet"] = df["Close"].shift(-horizon) / df["Close"] - 1.0
+    feat["Label"] = feat.apply(lambda r: rule_based_label(r, timeframe), axis=1)
+    feat["Label"] = feat["Label"].astype(int)
 
-    def label_row(r):
-        if pd.isna(r):
-            return np.nan
-        if r >= thr_buy:
-            return 2  # Buy
-        elif r <= thr_sell:
-            return 0  # Sell
-        else:
-            return 1  # Hold
-
-    feat["Label"] = feat["FutureRet"].apply(label_row)
-
-    # Drop rows with NaNs in features or label
-    feat = feat.dropna(subset=["Label", "RSI_14", "Close"])
+    # Final cleanup
     feat = feat.dropna()
 
     return feat
@@ -653,10 +736,10 @@ def train_ml_model(df_all: pd.DataFrame, feature_cols: list):
     )
 
     clf = RandomForestClassifier(
-        n_estimators=400,      # more trees
-        max_depth=None,        # deeper trees (more decisive)
-        min_samples_leaf=5,    # avoid crazy overfit
-        class_weight=None,     # let data decide class balance
+        n_estimators=400,
+        max_depth=None,
+        min_samples_leaf=5,
+        class_weight=None,
         random_state=42,
     )
     clf.fit(X_train, y_train)
@@ -678,8 +761,8 @@ def predict_for_latest(df: pd.DataFrame, clf, feature_cols: list, timeframe: str
     row["Close"] = last["Close"].iloc[0]
     row["RSI_14"] = last["RSI_14"].iloc[0]
 
-    # Distances to SMAs
-    for s in [20, 50, 200]:
+    # Distances to SMAs (22, 50, 200)
+    for s in [22, 50, 200]:
         col = f"SMA_{s}"
         if col in df.columns:
             sma_val = last[col].iloc[0]
@@ -704,9 +787,9 @@ def predict_for_latest(df: pd.DataFrame, clf, feature_cols: list, timeframe: str
     close_series = df["Close"]
 
     high_L1 = close_series.rolling(L1, min_periods=1).max().iloc[-1]
-    low_L1  = close_series.rolling(L1, min_periods=1).min().iloc[-1]
+    low_L1 = close_series.rolling(L1, min_periods=1).min().iloc[-1]
     high_L2 = close_series.rolling(L2, min_periods=1).max().iloc[-1]
-    low_L2  = close_series.rolling(L2, min_periods=1).min().iloc[-1]
+    low_L2 = close_series.rolling(L2, min_periods=1).min().iloc[-1]
 
     c_last = last["Close"].iloc[0]
 
@@ -716,9 +799,12 @@ def predict_for_latest(df: pd.DataFrame, clf, feature_cols: list, timeframe: str
         return (c - ref) / ref
 
     row["Dist_L1_High"] = safe_dist(c_last, high_L1)
-    row["Dist_L1_Low"]  = safe_dist(c_last, low_L1)
+    row["Dist_L1_Low"] = safe_dist(c_last, low_L1)
     row["Dist_L2_High"] = safe_dist(c_last, high_L2)
-    row["Dist_L2_Low"]  = safe_dist(c_last, low_L2)
+    row["Dist_L2_Low"] = safe_dist(c_last, low_L2)
+
+    # For prediction we don't recompute divergence; model learned pattern from other features
+    # BullDiv / BearDiv are not in feature_cols, so no need here.
 
     # Replace NaNs with 0
     for k, v in row.items():
@@ -738,13 +824,7 @@ st.sidebar.header("Settings")
 default_tickers = [
      "360ONE.NS","3MINDIA.NS","ABB.NS","TIPSMUSIC.NS","ACC.NS","ACMESOLAR.NS","AIAENG.NS","APLAPOLLO.NS","AUBANK.NS","AWL.NS","AADHARHFC.NS",
     "AARTIIND.NS","AAVAS.NS","ABBOTINDIA.NS","ACE.NS","ADANIENSOL.NS","ADANIENT.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS","ATGL.NS",
-    "ABCAPITAL.NS","ABFRL.NS","ABREL.NS","ABSLAMC.NS","AEGISLOG.NS","AFCONS.NS","AFFLE.NS","AJANTPHARM.NS","AKUMS.NS","APLLTD.NS",
-    "ALIVUS.NS","ALKEM.NS","ALKYLAMINE.NS","ALOKINDS.NS","ARE&M.NS","AMBER.NS","AMBUJACEM.NS","ANANDRATHI.NS","ANANTRAJ.NS","ANGELONE.NS",
-    "APARINDS.NS","APOLLOHOSP.NS","APOLLOTYRE.NS","APTUS.NS","ASAHIINDIA.NS","ASHOKLEY.NS","ASIANPAINT.NS","ASTERDM.NS","ASTRAZEN.NS","ASTRAL.NS",
-    "ATUL.NS","AUROPHARMA.NS","AIIL.NS","DMART.NS","AXISBANK.NS","BASF.NS","BEML.NS","BLS.NS","BSE.NS","BAJAJ-AUTO.NS",
-    "BAJFINANCE.NS","BAJAJFINSV.NS","BAJAJHLDNG.NS","BAJAJHFL.NS","BALKRISIND.NS","BALRAMCHIN.NS","BANDHANBNK.NS","BANKBARODA.NS","BANKINDIA.NS","MAHABANK.NS",
-    "BATAINDIA.NS","BAYERCROP.NS","BERGEPAINT.NS","BDL.NS","BEL.NS","BHARATFORG.NS","BHEL.NS","BPCL.NS","BHARTIARTL.NS","BHARTIHEXA.NS",
-    "BIKAJI.NS",
+    "ABCAPITAL.NS","ABFRL.NS",
 ]
 
 ticker = st.sidebar.selectbox("Select Symbol", default_tickers)
@@ -795,7 +875,7 @@ with tabs[2]:
 # -------------------- ML TAB --------------------
 with tabs[3]:
     st.subheader("🤖 ML-Based Buy/Sell Recommendations (Hourly, Daily & Weekly)")
-    st.write("Model: RandomForestClassifier trained on RSI, SMA distances, returns, Elliott 0/5 flags, long-term highs/lows.")
+    st.write("Model: RandomForestClassifier trained on YOUR rule-based Buy/Sell/Hold labels using RSI, SMA(22/50/200) distances, returns, Elliott 0/5 flags, long-term highs/lows.")
 
     if st.button("Run ML Analysis on All Tickers"):
         all_hourly = []
@@ -840,9 +920,9 @@ with tabs[3]:
             feature_cols = [
                 "Close",
                 "RSI_14",
-                "Dist_SMA_{s}".format(s=20),
-                "Dist_SMA_{s}".format(s=50),
-                "Dist_SMA_{s}".format(s=200),
+                "Dist_SMA_22",
+                "Dist_SMA_50",
+                "Dist_SMA_200",
                 "Ret_3",
                 "Ret_5",
                 "Ret_10",
@@ -947,7 +1027,7 @@ with tabs[3]:
                 if sort_col is not None:
                     merged = merged.sort_values(sort_col, ascending=False, na_position="last")
 
-                # ---------- NEW: Text signal based on probabilities ----------
+                # ---------- Text signal based on probabilities ----------
                 def classify_signal(row):
                     # Prefer weekly > daily > hourly for naming
                     p_buy = row.get("P_Buy_Weekly", np.nan)
@@ -964,7 +1044,7 @@ with tabs[3]:
                     if np.isnan(p_buy) or np.isnan(p_sell):
                         return "No signal"
 
-                    # Strong thresholds
+                    # Strong thresholds (you can tweak later)
                     if p_buy >= 0.65 and p_sell <= 0.20:
                         return "🚀 Strong Buy"
                     if p_sell >= 0.65 and p_buy <= 0.20:
