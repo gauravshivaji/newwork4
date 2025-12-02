@@ -3,6 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
 # ML imports (optional)
 try:
@@ -617,13 +619,109 @@ if st.session_state.analysis_run:
 
     # --------- CHART TAB -------------
     with tab_chart:
-        ticker_for_chart = st.selectbox("Chart Ticker", selected_tickers)
-        chart_df = yf.download(ticker_for_chart, period=tf_conf["chart_period"], interval=interval, progress=False, threads=True)
+        ticker_for_chart = st.selectbox("Chart Ticker", selected_tickers, key="chart_ticker")
+
+        tf_keys = list(TIMEFRAME_CONFIG.keys())
+        default_chart_idx = tf_keys.index(timeframe_choice) if timeframe_choice in tf_keys else 2
+        chart_tf_choice = st.radio(
+            "Chart Timeframe",
+            tf_keys,
+            index=default_chart_idx,
+            horizontal=True
+        )
+        chart_tf_conf = TIMEFRAME_CONFIG[chart_tf_choice]
+
+        chart_period = chart_tf_conf["chart_period"]
+        chart_interval = chart_tf_conf["interval"]
+
+        chart_df = yf.download(
+            ticker_for_chart,
+            period=chart_period,
+            interval=chart_interval,
+            progress=False,
+            threads=True,
+        )
+
         if not chart_df.empty:
             chart_df = compute_features(chart_df, sma_tuple, support_window, zz_pct, zz_min_bars).dropna()
             if not chart_df.empty:
-                st.line_chart(chart_df[["Close", f"SMA{sma_w1}", f"SMA{sma_w2}", f"SMA{sma_w3}"]])
-                st.line_chart(chart_df[["RSI"]])
+                # TradingView-style: Candles + SMA + RSI subplot
+                fig = make_subplots(
+                    rows=2,
+                    cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.03,
+                    row_heights=[0.7, 0.3],
+                )
+
+                fig.add_trace(
+                    go.Candlestick(
+                        x=chart_df.index,
+                        open=chart_df["Open"],
+                        high=chart_df["High"],
+                        low=chart_df["Low"],
+                        close=chart_df["Close"],
+                        name="Price",
+                        showlegend=True,
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+                # SMAs
+                fig.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df[f"SMA{sma_w1}"],
+                        mode="lines",
+                        name=f"SMA{sma_w1}",
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df[f"SMA{sma_w2}"],
+                        mode="lines",
+                        name=f"SMA{sma_w2}",
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df[f"SMA{sma_w3}"],
+                        mode="lines",
+                        name=f"SMA{sma_w3}",
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+                # RSI
+                fig.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df["RSI"],
+                        mode="lines",
+                        name="RSI",
+                    ),
+                    row=2,
+                    col=1,
+                )
+
+                fig.update_xaxes(showspikes=True, rangeslider=dict(visible=False), row=1, col=1)
+                fig.update_xaxes(showspikes=True, row=2, col=1)
+                fig.update_yaxes(showspikes=True)
+
+                fig.update_layout(
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    hovermode="x unified",
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
 
                 latest = chart_df.iloc[-1]
                 phase_code = int(latest.get("Elliott_Phase_Code", 0))
@@ -631,7 +729,8 @@ if st.session_state.analysis_run:
                 wave_no = int(latest.get("Elliott_Wave_No", 0))
                 st.caption(
                     f"🌀 Elliott Phase: **{phase_text}** |  Wave#: **{wave_no}** |  "
-                    f"ZigZag: {zz_pct*100:.1f}% / {zz_min_bars} {tf_conf['unit_label']}"
+                    f"ZigZag: {zz_pct*100:.1f}% / {zz_min_bars} {chart_tf_conf['unit_label']} | "
+                    f"Timeframe: **{chart_tf_choice}**"
                 )
         else:
             st.warning("No chart data available.")
