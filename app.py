@@ -1,1072 +1,753 @@
-import streamlit as st
+import streamlit as st 
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
-
-# ML imports
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-
-# ---------------- PAGE CONFIG ----------------
-st.set_page_config(page_title="Elliott Wave + ML — Multi-Timeframe", layout="wide")
-st.title("📈 Elliott Wave 0 & 5 + ML Buy/Sell (1H / 1D / 1W)")
-st.caption("Strict Elliott + Structural Swing + Fibonacci + Trend Filters + Long-Term Context + ML Signals")
-
-
-# ---------------- DATA LOADER ----------------
-@st.cache_data(ttl=3600)
-def load_data(ticker, period, interval):
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.dropna().copy()
-    df.index = pd.to_datetime(df.index)
-    return df
-
-
-# ---------------- INDICATORS ----------------
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # SMAs (added 22 as per your rule)
-    for win in [20, 22, 50, 200]:
-        df[f"SMA_{win}"] = df["Close"].rolling(win).mean()
-
-    # RSI(14)
-    delta = df["Close"].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-
-    roll_up = gain.rolling(14).mean()
-    roll_down = loss.rolling(14).mean()
-
-    rs = roll_up / roll_down.replace(0, np.nan)
-    df["RSI_14"] = 100 - (100 / (1 + rs))
-
-    return df
-
-
-# ---------------- TIMEFRAME PARAMETERS ----------------
-def get_params(tf: str) -> dict:
-    if tf == "1h":
-        return dict(pivot_k=3, swing_window=25, fib_window=80, future_n=7)
-    elif tf == "1wk":
-        return dict(pivot_k=2, swing_window=10, fib_window=30, future_n=3)
-    else:  # daily default
-        return dict(pivot_k=5, swing_window=20, fib_window=60, future_n=5)
-
-
-def get_longterm_windows(timeframe: str):
-    """
-    Long-term lookback windows (in candles) for different timeframes.
-    L1 = medium-term, L2 = very long-term.
-    """
-    if timeframe == "1h":
-        # 1h candles, last 60 days:
-        # L1 ≈ 1 week, L2 ≈ ~1 month of trading hours (approx)
-        return 24 * 5, 24 * 20          # 120, 480
-    elif timeframe == "1d":
-        # Daily: ~252 trading days per year
-        return 252, 252 * 3             # 1-year, 3-year
-    elif timeframe == "1wk":
-        # Weekly: 52 weeks per year
-        return 52, 52 * 5               # 1-year, 5-year
-    else:
-        # Default: treat as daily
-        return 252, 252 * 3
-
-
-# ---------------- PIVOTS ----------------
-def pivot_lows(df: pd.DataFrame, k: int) -> np.ndarray:
-    lows = df["Low"].values
-    n = len(df)
-    piv = np.zeros(n, dtype=bool)
-    for i in range(k, n - k):
-        if lows[i] == lows[i - k:i + k + 1].min():
-            piv[i] = True
-    return piv
-
-
-def pivot_highs(df: pd.DataFrame, k: int) -> np.ndarray:
-    highs = df["High"].values
-    n = len(df)
-    piv = np.zeros(n, dtype=bool)
-    for i in range(k, n - k):
-        if highs[i] == highs[i - k:i + k + 1].max():
-            piv[i] = True
-    return piv
-
-
-# ----------------------------------------------------------
-# ----------------- WAVE 0 RULES (A, B, C) -----------------
-# ----------------------------------------------------------
-def rule_A0(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Strict-ish Elliott style: RSI bottom + reversal + future up."""
-    n = len(df)
-    A0 = np.zeros(n, dtype=bool)
-
-    rsi = df["RSI_14"].values
-    close = df["Close"].values
-    future_n = params["future_n"]
-
-    for i in range(2, n - future_n - 5):
-        if not piv[i]:
-            continue
-
-        if np.isnan(rsi[i]) or np.isnan(rsi[i - 1]):
-            continue
-
-        # RSI oversold-ish AND turning up
-        if rsi[i] > 40 or rsi[i] <= rsi[i - 1]:
-            continue
-
-        # Price turning up
-        if close[i] <= close[i - 1]:
-            continue
-
-        # Future confirmation: after N bars, price higher than 0
-        if close[i + future_n] <= close[i]:
-            continue
-
-        A0[i] = True
-
-    return A0
-
-
-def rule_B0(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Pure swing low: lowest in recent window + future price up."""
-    n = len(df)
-    B0 = np.zeros(n, dtype=bool)
-
-    low = df["Low"].values
-    close = df["Close"].values
-    swing = params["swing_window"]
-    future_n = params["future_n"]
-
-    for i in range(n - future_n):
-        if not piv[i]:
-            continue
-
-        start = max(0, i - swing)
-        if low[i] != low[start:i + 1].min():
-            continue
-
-        if close[i + future_n] <= close[i]:
-            continue
-
-        B0[i] = True
-
-    return B0
-
-
-def rule_C0(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Fibonacci retracement: 0 near 61.8–100% retracement of prior move."""
-    n = len(df)
-    C0 = np.zeros(n, dtype=bool)
-
-    low = df["Low"].values
-    fib_win = params["fib_window"]
-
-    for i in range(n):
-        if not piv[i]:
-            continue
-
-        start = max(0, i - fib_win)
-        if start >= i:
-            continue
-
-        prev_high = df["High"].iloc[start:i].max()
-        if prev_high <= 0:
-            continue
-
-        retr = (prev_high - low[i]) / prev_high  # % drop from prev high
-
-        if 0.58 <= retr <= 1.05:  # 58%–105% zone
-            C0[i] = True
-
-    return C0
-
-
-# ----------------------------------------------------------
-# ----------------- FINAL WAVE 0 (A OR B OR C) --------------
-# ----------------------------------------------------------
-def add_wave0(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    df = df.copy()
-    params = get_params(timeframe)
-
-    piv = pivot_lows(df, params["pivot_k"])
-
-    A0 = rule_A0(df, piv, params)
-    B0 = rule_B0(df, piv, params)
-    C0 = rule_C0(df, piv, params)
-
-    combined = A0 | B0 | C0
-
-    low = df["Low"].values
-    close = df["Close"].values
-    n = len(df)
-
-    # 1) Cluster filter: keep LOWEST low in each neighborhood
-    cluster_mask = np.zeros(n, dtype=bool)
-    last_idx = None
-    last_low = None
-
-    for idx in np.where(combined)[0]:
-        if last_idx is None:
-            cluster_mask[idx] = True
-            last_idx = idx
-            last_low = low[idx]
-        else:
-            if idx - last_idx < params["swing_window"]:
-                # same cluster — keep lower low
-                if low[idx] < last_low:
-                    cluster_mask[last_idx] = False
-                    cluster_mask[idx] = True
-                    last_idx = idx
-                    last_low = low[idx]
-            else:
-                cluster_mask[idx] = True
-                last_idx = idx
-                last_low = low[idx]
-
-    # 2) Strong trend filter:
-    # After 0 → no lower low AND final close higher than 0's close
-    protect_n = 2 * params["swing_window"]
-    final = np.zeros(n, dtype=bool)
-    candidate_idxs = np.where(cluster_mask)[0]
-
-    for idx in candidate_idxs:
-        start_f = idx + 1
-        end_f = min(n, idx + 1 + protect_n)
-
-        if start_f >= end_f:
-            # not enough future bars, we keep it
-            final[idx] = True
-            continue
-
-        future_lows = low[start_f:end_f]
-        future_closes = close[start_f:end_f]
-
-        # If any lower low occurs → discard
-        if future_lows.min() < low[idx]:
-            continue
-
-        # Require net up move: last close in window > close at 0
-        if future_closes[-1] <= close[idx]:
-            continue
-
-        final[idx] = True
-
-    df["Wave0"] = final
-    return df
-
-
-# ----------------------------------------------------------
-# ----------------- WAVE 5 RULES (A, B, C) -----------------
-# ----------------------------------------------------------
-def rule_A5(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Strict-ish Elliott style top: RSI top + reversal + future down."""
-    n = len(df)
-    A5 = np.zeros(n, dtype=bool)
-
-    rsi = df["RSI_14"].values
-    close = df["Close"].values
-    future_n = params["future_n"]
-
-    for i in range(2, n - future_n - 5):
-        if not piv[i]:
-            continue
-
-        if np.isnan(rsi[i]) or np.isnan(rsi[i - 1]):
-            continue
-
-        # RSI overbought-ish AND turning down
-        if rsi[i] < 60 or rsi[i] >= rsi[i - 1]:
-            continue
-
-        # Price turning down
-        if close[i] >= close[i - 1]:
-            continue
-
-        # Future confirmation: after N bars, price below 5
-        if close[i + future_n] >= close[i]:
-            continue
-
-        A5[i] = True
-
-    return A5
-
-
-def rule_B5(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Pure swing high: highest in recent window + future price down."""
-    n = len(df)
-    B5 = np.zeros(n, dtype=bool)
-
-    high = df["High"].values
-    close = df["Close"].values
-    swing = params["swing_window"]
-    future_n = params["future_n"]
-
-    for i in range(n - future_n):
-        if not piv[i]:
-            continue
-
-        start = max(0, i - swing)
-        if high[i] != high[start:i + 1].max():
-            continue
-
-        if close[i + future_n] >= close[i]:
-            continue
-
-        B5[i] = True
-
-    return B5
-
-
-def rule_C5(df: pd.DataFrame, piv: np.ndarray, params: dict) -> np.ndarray:
-    """Fibonacci extension: 5 near 1.0–2.0 extension of prior swing."""
-    n = len(df)
-    C5 = np.zeros(n, dtype=bool)
-
-    high = df["High"].values
-    low = df["Low"].values
-    fib_win = params["fib_window"]
-
-    for i in range(n):
-        if not piv[i]:
-            continue
-
-        start = max(0, i - fib_win)
-        if start >= i:
-            continue
-
-        prev_low = low[start:i].min()
-        if prev_low <= 0:
-            continue
-
-        ext = (high[i] - prev_low) / prev_low  # % move from swing low
-
-        # rough terminal extension band
-        if 0.95 <= ext <= 2.05:
-            C5[i] = True
-
-    return C5
-
-
-# ----------------------------------------------------------
-# ----------------- FINAL WAVE 5 (A OR B OR C) --------------
-# ----------------------------------------------------------
-def add_wave5(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    df = df.copy()
-    params = get_params(timeframe)
-
-    piv = pivot_highs(df, params["pivot_k"])
-
-    A5 = rule_A5(df, piv, params)
-    B5 = rule_B5(df, piv, params)
-    C5 = rule_C5(df, piv, params)
-
-    combined = A5 | B5 | C5
-
-    high = df["High"].values
-    close = df["Close"].values
-    n = len(df)
-
-    # 1) Cluster filter: keep HIGHEST high in each neighborhood
-    cluster_mask = np.zeros(n, dtype=bool)
-    last_idx = None
-    last_high = None
-
-    for idx in np.where(combined)[0]:
-        if last_idx is None:
-            cluster_mask[idx] = True
-            last_idx = idx
-            last_high = high[idx]
-        else:
-            if idx - last_idx < params["swing_window"]:
-                # same cluster — keep higher high
-                if high[idx] > last_high:
-                    cluster_mask[last_idx] = False
-                    cluster_mask[idx] = True
-                    last_idx = idx
-                    last_high = high[idx]
-            else:
-                cluster_mask[idx] = True
-                last_idx = idx
-                last_high = high[idx]
-
-    # 2) Strong trend filter:
-    # After 5 → no higher high AND final close lower than 5's close
-    protect_n = 2 * params["swing_window"]
-    final = np.zeros(n, dtype=bool)
-    candidate_idxs = np.where(cluster_mask)[0]
-
-    for idx in candidate_idxs:
-        start_f = idx + 1
-        end_f = min(n, idx + 1 + protect_n)
-
-        if start_f >= end_f:
-            # not enough future bars, we keep it
-            final[idx] = True
-            continue
-
-        future_highs = high[start_f:end_f]
-        future_closes = close[start_f:end_f]
-
-        # If any higher high occurs → discard
-        if future_highs.max() > high[idx]:
-            continue
-
-        # Require net down move: last close in window < close at 5
-        if future_closes[-1] >= close[idx]:
-            continue
-
-        final[idx] = True
-
-    df["Wave5"] = final
-    return df
-
-
-# ----------------------------------------------------------
-# ----------------- CHART PLOTTING -------------------------
-# ----------------------------------------------------------
-def plot_chart(df: pd.DataFrame, title: str):
-    if df is None or df.empty:
-        return go.Figure()
-
-    x = df.index
-
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        row_heights=[0.7, 0.15, 0.15],
-        vertical_spacing=0.03,
-        specs=[
-            [{"type": "candlestick"}],
-            [{"type": "bar"}],
-            [{"type": "scatter"}],
-        ],
-    )
-
-    # Price
-    fig.add_trace(
-        go.Candlestick(
-            x=x,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Price",
-        ),
-        row=1,
-        col=1,
-    )
-
-    # SMAs (still plotting 20/50/200 for clarity)
-    for s in [20, 50, 200]:
-        col = f"SMA_{s}"
-        if col in df.columns:
-            fig.add_trace(
-                go.Scatter(x=x, y=df[col], mode="lines", name=f"SMA {s}"),
-                row=1,
-                col=1,
-            )
-
-    # Wave 0
-    if "Wave0" in df.columns:
-        w0 = df[df["Wave0"]]
-        if not w0.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=w0.index,
-                    y=w0["Low"] * 0.995,
-                    mode="text",
-                    text=["0"] * len(w0),
-                    textposition="middle center",
-                    name="Wave 0",
-                ),
-                row=1,
-                col=1,
-            )
-
-    # Wave 5
-    if "Wave5" in df.columns:
-        w5 = df[df["Wave5"]]
-        if not w5.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=w5.index,
-                    y=w5["High"] * 1.005,
-                    mode="text",
-                    text=["5"] * len(w5),
-                    textposition="middle center",
-                    name="Wave 5",
-                ),
-                row=1,
-                col=1,
-            )
-
-    # Volume
-    if "Volume" in df.columns:
-        fig.add_trace(
-            go.Bar(x=x, y=df["Volume"], name="Volume"),
-            row=2,
-            col=1,
-        )
-
-    # RSI
-    if "RSI_14" in df.columns:
-        fig.add_trace(
-            go.Scatter(x=x, y=df["RSI_14"], mode="lines", name="RSI 14"),
-            row=3,
-            col=1,
-        )
-        fig.add_hrect(
-            y0=30,
-            y1=70,
-            fillcolor="lightgray",
-            opacity=0.2,
-            line_width=0,
-            row=3,
-            col=1,
-        )
-
-    fig.update_layout(
-        title=title,
-        height=900,
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-
-    return fig
-
-
-# ----------------------------------------------------------
-# ------------- RULE-BASED LABEL (YOUR LOGIC) --------------
-# ----------------------------------------------------------
-def rule_based_label(row, timeframe: str) -> int:
-    """
-    Your rules:
-
-    BUY (2):
-      - price < SMA22 < SMA50 < SMA200 (we approximate via Dist_SMA_x < 0)
-      - RSI oversold
-      - bullish divergence
-      - price near good support
-      - Elliott phase ~ 0/2/4 (use Wave0 or bullish divergence)
-
-    SELL (0):
-      - price > SMA22 > SMA50 > SMA200
-      - RSI overbought
-      - bearish divergence
-      - price near resistance
-      - Elliott phase ~ 1/3/5 (use Wave5 or bearish divergence)
-
-    HOLD (1) otherwise.
-    """
-
-    rsi = row["RSI_14"]
-    d22 = row["Dist_SMA_22"]
-    d50 = row["Dist_SMA_50"]
-    d200 = row["Dist_SMA_200"]
-
-    wave0 = row["Wave0_Flag"]
-    wave5 = row["Wave5_Flag"]
-    bull_div = bool(row["BullDiv"])
-    bear_div = bool(row["BearDiv"])
-
-    dist_l1_low = row["Dist_L1_Low"]
-    dist_l1_high = row["Dist_L1_High"]
-
-    # ---------- BUY RULES ----------
-    # Price below all SMAs (approx for price < SMA22 < SMA50 < SMA200)
-    buy_price_ma = (d22 < 0) and (d50 < 0) and (d200 < 0)
-
-    # RSI oversold-ish
-    buy_rsi = (rsi <= 35)
-
-    # Good support: close near long-term low (0% to +10% above L1 low)
-    support_ok = (0.0 <= dist_l1_low <= 0.10)
-
-    # Elliott phase ~ 0/2/4
-    elliott_buy_ok = (wave0 == 1) or (bull_div and wave5 == 0)
-
-    if buy_price_ma and buy_rsi and bull_div and support_ok and elliott_buy_ok:
-        return 2  # BUY
-
-    # ---------- SELL RULES ----------
-    # Price above all SMAs (approx for price > SMA22 > SMA50 > SMA200)
-    sell_price_ma = (d22 > 0) and (d50 > 0) and (d200 > 0)
-
-    # RSI overbought-ish
-    sell_rsi = (rsi >= 65)
-
-    # Near resistance: close near long-term high (-5% to 0% below L1 high)
-    resistance_ok = (-0.05 <= dist_l1_high <= 0.0)
-
-    # Elliott phase ~ 1/3/5
-    elliott_sell_ok = (wave5 == 1) or (bear_div and wave0 == 0)
-
-    if sell_price_ma and sell_rsi and bear_div and resistance_ok and elliott_sell_ok:
-        return 0  # SELL
-
-    # ---------- OTHERWISE HOLD ----------
-    return 1  # HOLD / NEUTRAL
-
-
-# ----------------------------------------------------------
-# ----------------- ML FEATURE BUILDER ----------------------
-# ----------------------------------------------------------
-def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataFrame:
-    """
-    Build ML-ready features + YOUR rule-based label for one ticker & timeframe.
-    Label:
-        0 = Sell (your conditions)
-        1 = Hold
-        2 = Buy  (your conditions)
-    """
-    df = df.copy()
-
-    # ---------- Compute divergences using pivots ----------
-    params = get_params(timeframe)
-    k = params["pivot_k"]
-
-    n = len(df)
-    rsi = df["RSI_14"].values
-    close = df["Close"].values
-
-    piv_l = pivot_lows(df, k)
-    piv_h = pivot_highs(df, k)
-
-    bull_div = np.zeros(n, dtype=bool)
-    bear_div = np.zeros(n, dtype=bool)
-
-    # Bullish divergence: price lower low, RSI higher low
-    last_low_idx = None
-    for i in range(n):
-        if piv_l[i] and not np.isnan(rsi[i]):
-            if last_low_idx is not None and not np.isnan(rsi[last_low_idx]):
-                if close[i] < close[last_low_idx] and rsi[i] > rsi[last_low_idx]:
-                    bull_div[i] = True
-            last_low_idx = i
-
-    # Bearish divergence: price higher high, RSI lower high
-    last_high_idx = None
-    for i in range(n):
-        if piv_h[i] and not np.isnan(rsi[i]):
-            if last_high_idx is not None and not np.isnan(rsi[last_high_idx]):
-                if close[i] > close[last_high_idx] and rsi[i] < rsi[last_high_idx]:
-                    bear_div[i] = True
-            last_high_idx = i
-
-    # ---------- Basic feature frame ----------
-    feat = pd.DataFrame(index=df.index)
-    feat["Ticker"] = ticker
-    feat["Close"] = df["Close"]
-    feat["RSI_14"] = df["RSI_14"]
-
-    # Distances to SMA (22, 50, 200)
-    for s in [22, 50, 200]:
-        col = f"SMA_{s}"
-        if col in df.columns:
-            feat[f"Dist_SMA_{s}"] = (df["Close"] - df[col]) / df[col]
-        else:
-            feat[f"Dist_SMA_{s}"] = np.nan
-
-    # Short-term returns as extra features
-    feat["Ret_3"] = df["Close"].pct_change(3)
-    feat["Ret_5"] = df["Close"].pct_change(5)
-    feat["Ret_10"] = df["Close"].pct_change(10)
-
-    # Elliott info (Wave0 / Wave5 flags)
-    feat["Wave0_Flag"] = df.get("Wave0", pd.Series(False, index=df.index)).astype(int)
-    feat["Wave5_Flag"] = df.get("Wave5", pd.Series(False, index=df.index)).astype(int)
-
-    # Divergence flags
-    feat["BullDiv"] = bull_div
-    feat["BearDiv"] = bear_div
-
-    # ---------- Long-term high/low features ----------
-    L1, L2 = get_longterm_windows(timeframe)
-    close_ser = df["Close"]
-
-    high_L1 = close_ser.rolling(L1, min_periods=1).max()
-    low_L1 = close_ser.rolling(L1, min_periods=1).min()
-    high_L2 = close_ser.rolling(L2, min_periods=1).max()
-    low_L2 = close_ser.rolling(L2, min_periods=1).min()
-
-    feat["Dist_L1_High"] = (close_ser - high_L1) / high_L1.replace(0, np.nan)
-    feat["Dist_L1_Low"] = (close_ser - low_L1) / low_L1.replace(0, np.nan)
-    feat["Dist_L2_High"] = (close_ser - high_L2) / high_L2.replace(0, np.nan)
-    feat["Dist_L2_Low"] = (close_ser - low_L2) / low_L2.replace(0, np.nan)
-
-    # ---------- Apply your rule-based labels ----------
-    # Drop rows where core indicators missing
-    feat = feat.dropna(subset=["RSI_14", "Close", "Dist_SMA_22", "Dist_SMA_50", "Dist_SMA_200"])
-
-    feat["Label"] = feat.apply(lambda r: rule_based_label(r, timeframe), axis=1)
-    feat["Label"] = feat["Label"].astype(int)
-
-    # Final cleanup
-    feat = feat.dropna()
-
-    return feat
-
-
-def train_ml_model(df_all: pd.DataFrame, feature_cols: list):
-    """
-    Train RandomForest model on all rows in df_all.
-    """
-    if df_all.empty:
-        return None, None
-
-    X = df_all[feature_cols].values
-    y = df_all["Label"].astype(int).values
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, shuffle=False
-    )
-
-    clf = RandomForestClassifier(
-        n_estimators=400,
-        max_depth=None,
-        min_samples_leaf=5,
-        class_weight=None,
-        random_state=42,
-    )
-    clf.fit(X_train, y_train)
-
-    return clf, df_all
-
-
-def predict_for_latest(df: pd.DataFrame, clf, feature_cols: list, timeframe: str):
-    """
-    Take last row of df, build feature vector, return probas for classes 0,1,2.
-    """
-    if df.empty or clf is None:
-        return None
-
-    df = df.copy()
-    last = df.iloc[-1:]
-
-    row = {}
-    row["Close"] = last["Close"].iloc[0]
-    row["RSI_14"] = last["RSI_14"].iloc[0]
-
-    # Distances to SMAs (22, 50, 200)
-    for s in [22, 50, 200]:
-        col = f"SMA_{s}"
-        if col in df.columns:
-            sma_val = last[col].iloc[0]
-            if not pd.isna(sma_val) and sma_val != 0:
-                row[f"Dist_SMA_{s}"] = (last["Close"].iloc[0] - sma_val) / sma_val
-            else:
-                row[f"Dist_SMA_{s}"] = 0.0
-        else:
-            row[f"Dist_SMA_{s}"] = 0.0
-
-    # Past returns
-    row["Ret_3"] = df["Close"].pct_change(3).iloc[-1]
-    row["Ret_5"] = df["Close"].pct_change(5).iloc[-1]
-    row["Ret_10"] = df["Close"].pct_change(10).iloc[-1]
-
-    # Elliott flags
-    row["Wave0_Flag"] = int(last.get("Wave0", pd.Series([False])).iloc[0])
-    row["Wave5_Flag"] = int(last.get("Wave5", pd.Series([False])).iloc[0])
-
-    # Long-term highs/lows for last bar
-    L1, L2 = get_longterm_windows(timeframe)
-    close_series = df["Close"]
-
-    high_L1 = close_series.rolling(L1, min_periods=1).max().iloc[-1]
-    low_L1 = close_series.rolling(L1, min_periods=1).min().iloc[-1]
-    high_L2 = close_series.rolling(L2, min_periods=1).max().iloc[-1]
-    low_L2 = close_series.rolling(L2, min_periods=1).min().iloc[-1]
-
-    c_last = last["Close"].iloc[0]
-
-    def safe_dist(c, ref):
-        if pd.isna(ref) or ref == 0:
-            return 0.0
-        return (c - ref) / ref
-
-    row["Dist_L1_High"] = safe_dist(c_last, high_L1)
-    row["Dist_L1_Low"] = safe_dist(c_last, low_L1)
-    row["Dist_L2_High"] = safe_dist(c_last, high_L2)
-    row["Dist_L2_Low"] = safe_dist(c_last, low_L2)
-
-    # For prediction we don't recompute divergence; model learned pattern from other features
-    # BullDiv / BearDiv are not in feature_cols, so no need here.
-
-    # Replace NaNs with 0
-    for k, v in row.items():
-        if pd.isna(v):
-            row[k] = 0.0
-
-    X = np.array([[row[c] for c in feature_cols]])
-    proba = clf.predict_proba(X)[0]  # [P(Sell), P(Hold), P(Buy)]
-    return proba
-
-
-# ----------------------------------------------------------
-# --------------------------- UI ---------------------------
-# ----------------------------------------------------------
-st.sidebar.header("Settings")
-
-default_tickers = [
-     "360ONE.NS","3MINDIA.NS","ABB.NS","TIPSMUSIC.NS","ACC.NS","ACMESOLAR.NS","AIAENG.NS","APLAPOLLO.NS","AUBANK.NS","AWL.NS","AADHARHFC.NS",
+import ta
+
+# ML imports (optional)
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import classification_report, accuracy_score
+    from sklearn.model_selection import train_test_split
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+# ---------------- CONFIG ----------------
+if 'analysis_run' not in st.session_state:
+    st.session_state.analysis_run = False
+
+st.set_page_config(page_title="Nifty500 Multi-Timeframe Buy/Sell Predictor", layout="wide")
+st.title("📊 Nifty500 Buy/Sell Predictor — Rules + Elliott Wave + ML (1H / 1D / 1W)")
+
+# ---------------- TIMEFRAME CONFIGS ----------------
+TIMEFRAME_CONFIG = {
+    "Hourly (1H)": {
+        "period": "180d",
+        "interval": "1h",
+        "unit_label": "hours",
+        "chart_period": "60d",
+        "default_sma": (20, 50, 200),
+        "support_default": 72,  # ~3 days of hourly bars
+        "zz_pct_default": 0.03,
+        "zz_min_bars_default": 8,
+        "rsi_buy_default": 30,
+        "rsi_sell_default": 70,
+        "ml_horizon_default": 24,    # 1 day of trading hours
+        "ml_buy_thr_default": 0.03,
+        "ml_sell_thr_default": -0.03,
+        "min_rows": 500,
+    },
+    "Daily (1D)": {
+        "period": "3y",
+        "interval": "1d",
+        "unit_label": "days",
+        "chart_period": "3y",
+        "default_sma": (20, 50, 200),
+        "support_default": 60,
+        "zz_pct_default": 0.04,
+        "zz_min_bars_default": 6,
+        "rsi_buy_default": 30,
+        "rsi_sell_default": 70,
+        "ml_horizon_default": 10,    # ~2 weeks
+        "ml_buy_thr_default": 0.08,
+        "ml_sell_thr_default": -0.06,
+        "min_rows": 250,
+    },
+    "Weekly (1W)": {
+        "period": "5y",
+        "interval": "1wk",
+        "unit_label": "weeks",
+        "chart_period": "5y",
+        "default_sma": (20, 50, 200),
+        "support_default": 30,
+        "zz_pct_default": 0.05,
+        "zz_min_bars_default": 5,
+        "rsi_buy_default": 30,
+        "rsi_sell_default": 70,
+        "ml_horizon_default": 8,     # ~2 months
+        "ml_buy_thr_default": 0.05,
+        "ml_sell_thr_default": -0.05,
+        "min_rows": 150,
+    },
+}
+
+# ---------------- TICKERS ----------------
+NIFTY500_TICKERS = [
+    "360ONE.NS","3MINDIA.NS","ABB.NS","TIPSMUSIC.NS","ACC.NS","ACMESOLAR.NS","AIAENG.NS","APLAPOLLO.NS","AUBANK.NS","AWL.NS","AADHARHFC.NS",
     "AARTIIND.NS","AAVAS.NS","ABBOTINDIA.NS","ACE.NS","ADANIENSOL.NS","ADANIENT.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS","ATGL.NS",
-    "ABCAPITAL.NS","ABFRL.NS",
+    "ABCAPITAL.NS","ABFRL.NS","ABREL.NS","ABSLAMC.NS","AEGISLOG.NS","AFCONS.NS","AFFLE.NS","AJANTPHARM.NS","AKUMS.NS","APLLTD.NS",
+    "ALIVUS.NS","ALKEM.NS","ALKYLAMINE.NS","ALOKINDS.NS","ARE&M.NS","AMBER.NS","AMBUJACEM.NS","ANANDRATHI.NS","ANANTRAJ.NS","ANGELONE.NS",
+    "APARINDS.NS","APOLLOHOSP.NS","APOLLOTYRE.NS","APTUS.NS","ASAHIINDIA.NS","ASHOKLEY.NS","ASIANPAINT.NS","ASTERDM.NS","ASTRAZEN.NS","ASTRAL.NS",
+    "ATUL.NS","AUROPHARMA.NS","AIIL.NS","DMART.NS","AXISBANK.NS","BASF.NS","BEML.NS","BLS.NS","BSE.NS","BAJAJ-AUTO.NS",
+    "BAJFINANCE.NS","BAJAJFINSV.NS","BAJAJHLDNG.NS","BAJAJHFL.NS","BALKRISIND.NS","BALRAMCHIN.NS","BANDHANBNK.NS","BANKBARODA.NS","BANKINDIA.NS","MAHABANK.NS",
+    "BATAINDIA.NS","BAYERCROP.NS","BERGEPAINT.NS","BDL.NS","BEL.NS","BHARATFORG.NS","BHEL.NS","BPCL.NS","BHARTIARTL.NS","BHARTIHEXA.NS",
+    "BIKAJI.NS","BIOCON.NS","BSOFT.NS","BLUEDART.NS","BLUESTARCO.NS","BBTC.NS","BOSCHLTD.NS","FIRSTCRY.NS","BRIGADE.NS","BRITANNIA.NS",
+    "MAPMYINDIA.NS","CCL.NS","CESC.NS","CGPOWER.NS","CRISIL.NS","CAMPUS.NS","CANFINHOME.NS","CANBK.NS","CAPLIPOINT.NS","CGCL.NS",
+    "CARBORUNIV.NS","CASTROLIND.NS","CEATLTD.NS","CENTRALBK.NS","CDSL.NS","CENTURYPLY.NS","CERA.NS","CHALET.NS","CHAMBLFERT.NS","CHENNPETRO.NS",
+    "CHOLAHLDNG.NS","CHOLAFIN.NS","CIPLA.NS","CUB.NS","CLEAN.NS","COALINDIA.NS","COCHINSHIP.NS","COFORGE.NS","COHANCE.NS","COLPAL.NS",
+    "CAMS.NS","CONCORDBIO.NS","CONCOR.NS","COROMANDEL.NS","CRAFTSMAN.NS","CREDITACC.NS","CROMPTON.NS","CUMMINSIND.NS","CYIENT.NS","DCMSHRIRAM.NS",
+    "DLF.NS","DOMS.NS","DABUR.NS","DALBHARAT.NS","DATAPATTNS.NS","DEEPAKFERT.NS","DEEPAKNTR.NS","DELHIVERY.NS","DEVYANI.NS","DIVISLAB.NS",
+    "DIXON.NS","LALPATHLAB.NS","DRREDDY.NS","DUMMYDBRLT.NS","EIDPARRY.NS","EIHOTEL.NS","EICHERMOT.NS","ELECON.NS","ELGIEQUIP.NS","EMAMILTD.NS",
+    "EMCURE.NS","ENDURANCE.NS","ENGINERSIN.NS","ERIS.NS","ESCORTS.NS","ETERNAL.NS","EXIDEIND.NS","NYKAA.NS","FEDERALBNK.NS","FACT.NS",
+    "FINCABLES.NS","FINPIPE.NS","FSL.NS","FIVESTAR.NS","FORTIS.NS","GAIL.NS","GVT&D.NS","GMRAIRPORT.NS","GRSE.NS","GICRE.NS",
+    "GILLETTE.NS","GLAND.NS","GLAXO.NS","GLENMARK.NS","MEDANTA.NS","GODIGIT.NS","GPIL.NS","GODFRYPHLP.NS","GODREJAGRO.NS","GODREJCP.NS",
+    "GODREJIND.NS","GODREJPROP.NS","GRANULES.NS","GRAPHITE.NS","GRASIM.NS","GRAVITA.NS","GESHIP.NS","FLUOROCHEM.NS","GUJGASLTD.NS","GMDCLTD.NS",
+    "GNFC.NS","GPPL.NS","GSPL.NS","HEG.NS","HBLENGINE.NS","HCLTECH.NS","HDFCAMC.NS","HDFCBANK.NS","HDFCLIFE.NS","HFCL.NS",
+    "HAPPSTMNDS.NS","HAVELLS.NS","HEROMOTOCO.NS","HSCL.NS","HINDALCO.NS","HAL.NS","HINDCOPPER.NS","HINDPETRO.NS","HINDUNILVR.NS","HINDZINC.NS",
+    "POWERINDIA.NS","HOMEFIRST.NS","HONASA.NS","HONAUT.NS","HUDCO.NS","HYUNDAI.NS","ICICIBANK.NS","ICICIGI.NS","ICICIPRULI.NS","IDBI.NS",
+    "IDFCFIRSTB.NS","IFCI.NS","IIFL.NS","INOXINDIA.NS","IRB.NS","IRCON.NS","ITC.NS","ITI.NS","INDGN.NS","INDIACEM.NS",
+    "INDIAMART.NS","INDIANB.NS","IEX.NS","INDHOTEL.NS","IOC.NS","IOB.NS","IRCTC.NS","IRFC.NS","IREDA.NS","IGL.NS",
+    "INDUSTOWER.NS","INDUSINDBK.NS","NAUKRI.NS","INFY.NS","INOXWIND.NS","INTELLECT.NS","INDIGO.NS","IGIL.NS","IKS.NS","IPCALAB.NS",
+    "JBCHEPHARM.NS","JKCEMENT.NS","JBMA.NS","JKTYRE.NS","JMFINANCIL.NS","JSWENERGY.NS","JSWHL.NS","JSWINFRA.NS","JSWSTEEL.NS","JPPOWER.NS",
+    "J&KBANK.NS","JINDALSAW.NS","JSL.NS","JINDALSTEL.NS","JIOFIN.NS","JUBLFOOD.NS","JUBLINGREA.NS","JUBLPHARMA.NS","JWL.NS","JUSTDIAL.NS",
+    "JYOTHYLAB.NS","JYOTICNC.NS","KPRMILL.NS","KEI.NS","KNRCON.NS","KPITTECH.NS","KAJARIACER.NS","KPIL.NS","KALYANKJIL.NS","KANSAINER.NS",
+    "KARURVYSYA.NS","KAYNES.NS","KEC.NS","KFINTECH.NS","KIRLOSBROS.NS","KIRLOSENG.NS","KOTAKBANK.NS","KIMS.NS","LTF.NS","LTTS.NS",
+    "LICHSGFIN.NS","LTFOODS.NS","LTIM.NS","LT.NS","LATENTVIEW.NS","LAURUSLABS.NS","LEMONTREE.NS","LICI.NS","LINDEINDIA.NS","LLOYDSME.NS",
+    "LODHA.NS","LUPIN.NS","MMTC.NS","MRF.NS","MGL.NS","MAHSEAMLES.NS","M&MFIN.NS","M&M.NS","MANAPPURAM.NS","MRPL.NS",
+    "MANKIND.NS","MARICO.NS","MARUTI.NS","MASTEK.NS","MFSL.NS","MAXHEALTH.NS","MAZDOCK.NS","METROPOLIS.NS","MINDACORP.NS","MSUMI.NS",
+    "MOTILALOFS.NS","MPHASIS.NS","MCX.NS","MUTHOOTFIN.NS","NATCOPHARM.NS","NBCC.NS","NCC.NS","NHPC.NS","NLCINDIA.NS","NMDC.NS",
+    "NSLNISP.NS","NTPCGREEN.NS","NTPC.NS","NH.NS","NATIONALUM.NS","NAVA.NS","NAVINFLUOR.NS","NESTLEIND.NS","NETWEB.NS","NETWORK18.NS",
+    "NEULANDLAB.NS","NEWGEN.NS","NAM-INDIA.NS","NIVABUPA.NS","NUVAMA.NS","OBEROIRLTY.NS","ONGC.NS","OIL.NS","OLAELEC.NS","OLECTRA.NS",
+    "PAYTM.NS","OFSS.NS","POLICYBZR.NS","PCBL.NS","PGEL.NS","PIIND.NS","PNBHOUSING.NS","PNCINFRA.NS","PTCIL.NS","PVRINOX.NS",
+    "PAGEIND.NS","PATANJALI.NS","PERSISTENT.NS","PETRONET.NS","PFIZER.NS","PHOENIXLTD.NS","PIDILITIND.NS","PEL.NS","PPLPHARMA.NS","POLYMED.NS",
+    "POLYCAB.NS","POONAWALLA.NS","PFC.NS","POWERGRID.NS","PRAJIND.NS","PREMIERENE.NS","PRESTIGE.NS","PNB.NS","RRKABEL.NS","RBLBANK.NS",
+    "RECLTD.NS","RHIM.NS","RITES.NS","RADICO.NS","RVNL.NS","RAILTEL.NS","RAINBOW.NS","RKFORGE.NS","RCF.NS","RTNINDIA.NS",
+    "RAYMONDLSL.NS","RAYMOND.NS","REDINGTON.NS","RELIANCE.NS","RPOWER.NS","ROUTE.NS","SBFC.NS","SBICARD.NS","SBILIFE.NS","SJVN.NS",
+    "SKFINDIA.NS","SRF.NS","SAGILITY.NS","SAILIFE.NS","SAMMAANCAP.NS","MOTHERSON.NS","SAPPHIRE.NS","SARDAEN.NS","SAREGAMA.NS","SCHAEFFLER.NS",
+    "SCHNEIDER.NS","SCI.NS","SHREECEM.NS","RENUKA.NS","SHRIRAMFIN.NS","SHYAMMETL.NS","SIEMENS.NS","SIGNATURE.NS","SOBHA.NS","SOLARINDS.NS",
+    "SONACOMS.NS","SONATSOFTW.NS","STARHEALTH.NS","SBIN.NS","SAIL.NS","SWSOLAR.NS","SUMICHEM.NS","SUNPHARMA.NS","SUNTV.NS","SUNDARMFIN.NS",
+    "SUNDRMFAST.NS","SUPREMEIND.NS","SUZLON.NS","SWANENERGY.NS","SWIGGY.NS","SYNGENE.NS","SYRMA.NS","TBOTEK.NS","TVSMOTOR.NS","TANLA.NS",
+    "TATACHEM.NS","TATACOMM.NS","TCS.NS","TATACONSUM.NS","TATAELXSI.NS","TATAINVEST.NS","TATAMOTORS.NS","TATAPOWER.NS","TATASTEEL.NS","TATATECH.NS",
+    "TTML.NS","TECHM.NS","TECHNOE.NS","TEJASNET.NS","NIACL.NS","RAMCOCEM.NS","THERMAX.NS","TIMKEN.NS","TITAGARH.NS","TITAN.NS",
+    "TORNTPHARM.NS","TORNTPOWER.NS","TARIL.NS","TRENT.NS","TRIDENT.NS","TRIVENI.NS","TRITURBINE.NS","TIINDIA.NS","UCOBANK.NS","UNOMINDA.NS",
+    "UPL.NS","UTIAMC.NS","ULTRACEMCO.NS","UNIONBANK.NS","UBL.NS","UNITDSPR.NS","USHAMART.NS","VGUARD.NS","DBREALTY.NS","VTL.NS",
+    "VBL.NS","MANYAVAR.NS","VEDL.NS","VIJAYA.NS","VMM.NS","IDEA.NS","VOLTAS.NS","WAAREEENER.NS","WELCORP.NS","WELSPUNLIV.NS",
+    "WESTLIFE.NS","WHIRLPOOL.NS","WIPRO.NS","WOCKPHARMA.NS","YESBANK.NS","ZFCVINDIA.NS","ZEEL.NS","ZENTEC.NS","ZENSARTECH.NS","ZYDUSLIFE.NS",
+    "ECLERX.NS",
 ]
 
-ticker = st.sidebar.selectbox("Select Symbol", default_tickers)
-custom = st.sidebar.text_input("Or Custom Symbol (Yahoo code)")
+# ---------------- UTIL ----------------
+class _TQDM:
+    def __init__(self, total, desc=""):
+        self.pb = st.progress(0, text=desc)
+        self.total = max(total, 1)
+        self.i = 0
+    def update(self):
+        self.i += 1
+        self.pb.progress(min(self.i / self.total, 1.0), text=f"{self.i}/{self.total}")
+    def close(self):
+        self.pb.empty()
 
-if custom.strip():
-    ticker = custom.strip()
+def stqdm(iterable, total=None, desc=""):
+    if total is None:
+        try:
+            total = len(iterable)
+        except Exception:
+            total = 100
+    bar = _TQDM(total=total, desc=desc)
+    for x in iterable:
+        yield x
+        bar.update()
+    bar.close()
 
-tabs = st.tabs(["⏱ 1H", "📅 Daily", "📆 Weekly", "🤖 ML Buy/Sell Signals"])
+@st.cache_data(show_spinner=False)
+def download_data_multi(tickers, period="5y", interval="1wk"):
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    frames = []
+    batch_size = 50
+    for i in stqdm(range(0, len(tickers), batch_size), desc=f"Downloading {interval} data", total=len(tickers)//batch_size + 1):
+        batch = tickers[i:i+batch_size]
+        try:
+            df = yf.download(batch, period=period, interval=interval, group_by="ticker", progress=False, threads=True)
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return None
+    out = pd.concat(frames, axis=1)
+    if isinstance(out.columns, pd.MultiIndex):
+        idx = pd.MultiIndex.from_tuples(list(dict.fromkeys(out.columns.tolist())))
+        out = out.loc[:, idx]
+    return out
 
+@st.cache_data(show_spinner=False)
+def load_history_for_ticker(ticker, period="5y", interval="1wk"):
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, threads=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-# 1H
-with tabs[0]:
-    df_h = load_data(ticker, "60d", "1h")
-    if df_h.empty:
-        st.warning("No hourly data.")
-    else:
-        df_h = add_indicators(df_h)
-        df_h = add_wave0(df_h, "1h")
-        df_h = add_wave5(df_h, "1h")
-        fig_h = plot_chart(df_h, f"{ticker} — 1H")
-        st.plotly_chart(fig_h, use_container_width=True)
+# ---------------- ELLIOTT WAVE (ZigZag + Heuristics) ----------------
+def zigzag_pivots(close: pd.Series, pct=0.05, min_bars=5):
+    if close.isna().all() or len(close) < max(50, min_bars*4):
+        return pd.DataFrame(columns=["idx", "price", "type"])
 
-# Daily
-with tabs[1]:
-    df_d = load_data(ticker, "3y", "1d")
-    if df_d.empty:
-        st.warning("No daily data.")
-    else:
-        df_d = add_indicators(df_d)
-        df_d = add_wave0(df_d, "1d")
-        df_d = add_wave5(df_d, "1d")
-        fig_d = plot_chart(df_d, f"{ticker} — Daily (3Y)")
-        st.plotly_chart(fig_d, use_container_width=True)
+    c = close.values.astype(float)
+    idxs = close.index
 
-# Weekly
-with tabs[2]:
-    df_w = load_data(ticker, "10y", "1wk")
-    if df_w.empty:
-        st.warning("No weekly data.")
-    else:
-        df_w = add_indicators(df_w)
-        df_w = add_wave0(df_w, "1wk")
-        df_w = add_wave5(df_w, "1wk")
-        fig_w = plot_chart(df_w, f"{ticker} — Weekly (10Y)")
-        st.plotly_chart(fig_w, use_container_width=True)
+    piv = []
+    last_piv_i = 0
+    last_piv_p = c[0]
+    trend = None
+    last_extreme_i = 0
+    last_extreme_p = c[0]
 
-# -------------------- ML TAB --------------------
-with tabs[3]:
-    st.subheader("🤖 ML-Based Buy/Sell Recommendations (Hourly, Daily & Weekly)")
-    st.write("Model: RandomForestClassifier trained on YOUR rule-based Buy/Sell/Hold labels using RSI, SMA(22/50/200) distances, returns, Elliott 0/5 flags, long-term highs/lows.")
+    for i in range(1, len(c)):
+        if trend in (None, 'up'):
+            if c[i] > last_extreme_p:
+                last_extreme_p = c[i]; last_extreme_i = i
+        if trend in (None, 'down'):
+            if c[i] < last_extreme_p:
+                last_extreme_p = c[i]; last_extreme_i = i
 
-    if st.button("Run ML Analysis on All Tickers"):
-        all_hourly = []
-        all_daily = []
-        all_weekly = []
+        if trend in (None, 'up'):
+            dd = (c[i] - last_extreme_p) / last_extreme_p if last_extreme_p != 0 else 0
+            if dd <= -pct and (i - last_piv_i) >= min_bars:
+                piv.append((idxs[last_extreme_i], float(last_extreme_p), 'H'))
+                last_piv_i = last_extreme_i; last_piv_p = last_extreme_p
+                trend = 'down'
+                last_extreme_i = i; last_extreme_p = c[i]
+        if trend in (None, 'down'):
+            uu = (c[i] - last_extreme_p) / last_extreme_p if last_extreme_p != 0 else 0
+            if uu >= pct and (i - last_piv_i) >= min_bars:
+                piv.append((idxs[last_extreme_i], float(last_extreme_p), 'L'))
+                last_piv_i = last_extreme_i; last_piv_p = last_extreme_p
+                trend = 'up'
+                last_extreme_i = i; last_extreme_p = c[i]
 
-        # Build hourly, daily & weekly ML datasets for all default tickers
-        for tk in default_tickers:
-            # HOURLY
-            df_h_all = load_data(tk, "60d", "1h")
-            if not df_h_all.empty:
-                df_h_all = add_indicators(df_h_all)
-                df_h_all = add_wave0(df_h_all, "1h")
-                df_h_all = add_wave5(df_h_all, "1h")
-                feat_h = build_ml_features(df_h_all, "1h", tk)
-                if not feat_h.empty:
-                    all_hourly.append(feat_h)
-
-            # DAILY
-            df_d_all = load_data(tk, "3y", "1d")
-            if not df_d_all.empty:
-                df_d_all = add_indicators(df_d_all)
-                df_d_all = add_wave0(df_d_all, "1d")
-                df_d_all = add_wave5(df_d_all, "1d")
-                feat_d = build_ml_features(df_d_all, "1d", tk)
-                if not feat_d.empty:
-                    all_daily.append(feat_d)
-
-            # WEEKLY
-            df_w_all = load_data(tk, "10y", "1wk")
-            if not df_w_all.empty:
-                df_w_all = add_indicators(df_w_all)
-                df_w_all = add_wave0(df_w_all, "1wk")
-                df_w_all = add_wave5(df_w_all, "1wk")
-                feat_w = build_ml_features(df_w_all, "1wk", tk)
-                if not feat_w.empty:
-                    all_weekly.append(feat_w)
-
-        if not all_daily and not all_weekly and not all_hourly:
-            st.error("No sufficient data to train ML models.")
-        else:
-            feature_cols = [
-                "Close",
-                "RSI_14",
-                "Dist_SMA_22",
-                "Dist_SMA_50",
-                "Dist_SMA_200",
-                "Ret_3",
-                "Ret_5",
-                "Ret_10",
-                "Wave0_Flag",
-                "Wave5_Flag",
-                "Dist_L1_High",
-                "Dist_L1_Low",
-                "Dist_L2_High",
-                "Dist_L2_Low",
-            ]
-
-            hourly_signals = None
-            daily_signals = None
-            weekly_signals = None
-
-            # HOURLY MODEL
-            if all_hourly:
-                df_hourly_all = pd.concat(all_hourly, ignore_index=True)
-                hourly_model, _ = train_ml_model(df_hourly_all, feature_cols)
-
-                rows_h = []
-                for tk in default_tickers:
-                    df_h_curr = load_data(tk, "60d", "1h")
-                    if df_h_curr.empty:
-                        continue
-                    df_h_curr = add_indicators(df_h_curr)
-                    df_h_curr = add_wave0(df_h_curr, "1h")
-                    df_h_curr = add_wave5(df_h_curr, "1h")
-                    proba_h = predict_for_latest(df_h_curr, hourly_model, feature_cols, "1h")
-                    if proba_h is None:
-                        continue
-                    rows_h.append({
-                        "Ticker": tk,
-                        "P_Buy_Hourly": proba_h[2],
-                        "P_Sell_Hourly": proba_h[0],
-                    })
-                hourly_signals = pd.DataFrame(rows_h)
-
-            # DAILY MODEL
-            if all_daily:
-                df_daily_all = pd.concat(all_daily, ignore_index=True)
-                daily_model, _ = train_ml_model(df_daily_all, feature_cols)
-
-                rows = []
-                for tk in default_tickers:
-                    df_d_curr = load_data(tk, "3y", "1d")
-                    if df_d_curr.empty:
-                        continue
-                    df_d_curr = add_indicators(df_d_curr)
-                    df_d_curr = add_wave0(df_d_curr, "1d")
-                    df_d_curr = add_wave5(df_d_curr, "1d")
-                    proba = predict_for_latest(df_d_curr, daily_model, feature_cols, "1d")
-                    if proba is None:
-                        continue
-                    rows.append({
-                        "Ticker": tk,
-                        "P_Buy_Daily": proba[2],
-                        "P_Sell_Daily": proba[0],
-                    })
-                daily_signals = pd.DataFrame(rows)
-
-            # WEEKLY MODEL
-            if all_weekly:
-                df_weekly_all = pd.concat(all_weekly, ignore_index=True)
-                weekly_model, _ = train_ml_model(df_weekly_all, feature_cols)
-
-                rows_w = []
-                for tk in default_tickers:
-                    df_w_curr = load_data(tk, "10y", "1wk")
-                    if df_w_curr.empty:
-                        continue
-                    df_w_curr = add_indicators(df_w_curr)
-                    df_w_curr = add_wave0(df_w_curr, "1wk")
-                    df_w_curr = add_wave5(df_w_curr, "1wk")
-                    proba_w = predict_for_latest(df_w_curr, weekly_model, feature_cols, "1wk")
-                    if proba_w is None:
-                        continue
-                    rows_w.append({
-                        "Ticker": tk,
-                        "P_Buy_Weekly": proba_w[2],
-                        "P_Sell_Weekly": proba_w[0],
-                    })
-                weekly_signals = pd.DataFrame(rows_w)
-
-            # MERGE HOURLY + DAILY + WEEKLY
-            merged = None
-            for sig in [hourly_signals, daily_signals, weekly_signals]:
-                if sig is None or sig.empty:
-                    continue
-                if merged is None:
-                    merged = sig.copy()
+    if len(piv) >= 2:
+        cleaned = [piv[0]]
+        for i in range(1, len(piv)):
+            t_i = piv[i][2]
+            t_prev = cleaned[-1][2]
+            if t_i == t_prev:
+                prev = cleaned[-1]
+                if t_i == 'H':
+                    better = piv[i][1] > prev[1]
                 else:
-                    merged = pd.merge(merged, sig, on="Ticker", how="outer")
-
-            if merged is not None and not merged.empty:
-                # choose a sort column: prefer daily, then weekly, then hourly
-                sort_col = None
-                for c in ["P_Buy_Daily", "P_Buy_Weekly", "P_Buy_Hourly"]:
-                    if c in merged.columns:
-                        sort_col = c
-                        break
-                if sort_col is not None:
-                    merged = merged.sort_values(sort_col, ascending=False, na_position="last")
-
-                # ---------- Text signal based on probabilities ----------
-                def classify_signal(row):
-                    # Prefer weekly > daily > hourly for naming
-                    p_buy = row.get("P_Buy_Weekly", np.nan)
-                    p_sell = row.get("P_Sell_Weekly", np.nan)
-
-                    if np.isnan(p_buy) or np.isnan(p_sell):
-                        p_buy = row.get("P_Buy_Daily", np.nan)
-                        p_sell = row.get("P_Sell_Daily", np.nan)
-
-                    if np.isnan(p_buy) or np.isnan(p_sell):
-                        p_buy = row.get("P_Buy_Hourly", np.nan)
-                        p_sell = row.get("P_Sell_Hourly", np.nan)
-
-                    if np.isnan(p_buy) or np.isnan(p_sell):
-                        return "No signal"
-
-                    # Strong thresholds (you can tweak later)
-                    if p_buy >= 0.65 and p_sell <= 0.20:
-                        return "🚀 Strong Buy"
-                    if p_sell >= 0.65 and p_buy <= 0.20:
-                        return "⚠️ Strong Sell"
-                    if p_buy >= 0.55 and p_sell <= 0.30:
-                        return "👍 Weak Buy"
-                    if p_sell >= 0.55 and p_buy <= 0.30:
-                        return "👎 Weak Sell"
-                    return "😐 Hold / Neutral"
-
-                merged["Signal"] = merged.apply(classify_signal, axis=1)
-
-                st.subheader("📋 Buy/Sell Probabilities per Ticker")
-                fmt = {}
-                for col in [
-                    "P_Buy_Hourly", "P_Sell_Hourly",
-                    "P_Buy_Daily", "P_Sell_Daily",
-                    "P_Buy_Weekly", "P_Sell_Weekly",
-                ]:
-                    if col in merged.columns:
-                        fmt[col] = "{:.2%}"
-
-                st.dataframe(merged.style.format(fmt))
+                    better = piv[i][1] < prev[1]
+                if better:
+                    cleaned[-1] = piv[i]
             else:
-                st.warning("Could not compute signals for any ticker.")
+                cleaned.append(piv[i])
+        piv = cleaned
+
+    if not piv:
+        return pd.DataFrame(columns=["idx", "price", "type"])
+    idx, price, typ = zip(*piv)
+    return pd.DataFrame({"idx": list(idx), "price": list(price), "type": list(typ)})
+
+def fib_okay(a, b, ratio, tol=0.18):
+    if b == 0 or np.isnan(a) or np.isnan(b):
+        return False
+    return abs((a / b) - ratio) <= tol * ratio
+
+def elliott_phase_from_pivots(pivots: pd.DataFrame):
+    out = {"phase": "Unknown", "wave_no": 0, "bullish": False, "bearish": False}
+    if pivots.empty:
+        return out
+
+    if len(pivots) >= 5:
+        p5 = pivots.iloc[-5:].reset_index(drop=True)
+        alt = all(p5.loc[i, "type"] != p5.loc[i-1, "type"] for i in range(1, 5))
+        if alt:
+            prices = p5["price"].values
+            types = p5["type"].values
+            up_pattern = (types.tolist() == ['L','H','L','H','L'])
+            down_pattern = (types.tolist() == ['H','L','H','L','H'])
+            if up_pattern:
+                hh_ok = prices[3] > prices[1]
+                hl_ok = prices[4] > prices[2]
+                w1 = prices[1] - prices[0]
+                w2 = prices[1] - prices[2]
+                w3 = prices[3] - prices[2]
+                w4 = prices[3] - prices[4]
+                fib2 = fib_okay(w2, w1, 0.382) or fib_okay(w2, w1, 0.5) or fib_okay(w2, w1, 0.618)
+                fib4 = fib_okay(w4, w3, 0.382) or fib_okay(w4, w3, 0.5) or fib_okay(w4, w3, 0.618)
+                if hh_ok and hl_ok and (fib2 or fib4):
+                    out.update({"phase": "ImpulseUp", "wave_no": 5, "bullish": True})
+                    return out
+            if down_pattern:
+                ll_ok = prices[3] < prices[1]
+                lh_ok = prices[4] < prices[2]
+                w1 = prices[0] - prices[1]
+                w2 = prices[2] - prices[1]
+                w3 = prices[2] - prices[3]
+                w4 = prices[4] - prices[3]
+                fib2 = fib_okay(w2, w1, 0.382) or fib_okay(w2, w1, 0.5) or fib_okay(w2, w1, 0.618)
+                fib4 = fib_okay(w4, w3, 0.382) or fib_okay(w4, w3, 0.5) or fib_okay(w4, w3, 0.618)
+                if ll_ok and lh_ok and (fib2 or fib4):
+                    out.update({"phase": "ImpulseDown", "wave_no": 5, "bearish": True})
+                    return out
+
+    if len(pivots) >= 3:
+        p3 = pivots.iloc[-3:].reset_index(drop=True)
+        alt3 = all(p3.loc[i, "type"] != p3.loc[i-1, "type"] for i in range(1, 3))
+        if alt3:
+            t = p3["type"].tolist()
+            if t == ['L','H','L']:
+                out.update({"phase": "CorrectionUp", "wave_no": 3, "bullish": True})
+            elif t == ['H','L','H']:
+                out.update({"phase": "CorrectionDown", "wave_no": 3, "bearish": True})
+    return out
+
+def add_elliott_features_core(df_close: pd.Series, pct=0.05, min_bars=5):
+    piv = zigzag_pivots(df_close, pct=pct, min_bars=min_bars)
+    phase = elliott_phase_from_pivots(piv)
+    return phase, piv
+
+# ---------------- FEATURE ENGINEERING ----------------
+def compute_features(df, sma_windows=(20, 50, 200), support_window=30, zz_pct=0.05, zz_min_bars=5):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+
+    if "Close" not in df.columns or df["Close"].dropna().empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    try:
+        df["RSI"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    except Exception:
+        df["RSI"] = np.nan
+
+    for win in sma_windows:
+        df[f"SMA{win}"] = df["Close"].rolling(window=win, min_periods=1).mean()
+
+    df["Support"] = df["Close"].rolling(window=support_window, min_periods=1).min()
+
+    df["RSI_Direction"] = df["RSI"].diff(5)
+    df["Price_Direction"] = df["Close"].diff(5)
+    df["Bullish_Div"] = (df["RSI_Direction"] > 0) & (df["Price_Direction"] < 0)
+    df["Bearish_Div"] = (df["RSI_Direction"] < 0) & (df["Price_Direction"] > 0)
+
+    for w in (1, 3, 5, 10):
+        df[f"Ret_{w}"] = df["Close"].pct_change(w)
+
+    for win in sma_windows:
+        df[f"Dist_SMA{win}"] = (df["Close"] - df[f"SMA{win}"]) / df[f"SMA{win}"]
+
+    for col in ["RSI"] + [f"SMA{w}" for w in sma_windows]:
+        df[f"{col}_slope"] = df[col].diff()
+
+    try:
+        phase, piv = add_elliott_features_core(df["Close"], pct=zz_pct, min_bars=zz_min_bars)
+        phase_map = {
+            "ImpulseUp": 1, "ImpulseDown": -1,
+            "CorrectionUp": 2, "CorrectionDown": -2,
+            "Unknown": 0
+        }
+        df["Elliott_Phase_Code"] = phase_map.get(phase["phase"], 0)
+        df["Elliott_Wave_No"] = int(phase.get("wave_no", 0))
+        df["Elliott_Bullish"] = bool(phase.get("bullish", False))
+        df["Elliott_Bearish"] = bool(phase.get("bearish", False))
+        df["Elliott_Bullish_Int"] = df["Elliott_Bullish"].astype(int)
+        df["Elliott_Bearish_Int"] = df["Elliott_Bearish"].astype(int)
+    except Exception:
+        df["Elliott_Phase_Code"] = 0
+        df["Elliott_Wave_No"] = 0
+        df["Elliott_Bullish"] = False
+        df["Elliott_Bearish"] = False
+        df["Elliott_Bullish_Int"] = 0
+        df["Elliott_Bearish_Int"] = 0
+
+    return df
+
+def get_latest_features_for_ticker(ticker_df, ticker, sma_windows, support_window, zz_pct, zz_min_bars):
+    df = compute_features(ticker_df, sma_windows, support_window, zz_pct, zz_min_bars).dropna()
+    if df.empty:
+        return None
+    latest = df.iloc[-1]
+    return {
+        "Ticker": ticker,
+        "Close": float(latest["Close"]),
+        "RSI": float(latest["RSI"]),
+        "Support": float(latest["Support"]),
+        **{f"SMA{w}": float(latest.get(f"SMA{w}", np.nan)) for w in sma_windows},
+        "Bullish_Div": bool(latest["Bullish_Div"]),
+        "Bearish_Div": bool(latest["Bearish_Div"]),
+        "Elliott_Phase_Code": int(latest.get("Elliott_Phase_Code", 0)),
+        "Elliott_Wave_No": int(latest.get("Elliott_Wave_No", 0)),
+        "Elliott_Bullish_Int": int(latest.get("Elliott_Bullish_Int", 0)),
+        "Elliott_Bearish_Int": int(latest.get("Elliott_Bearish_Int", 0)),
+    }
+
+def get_features_for_all(tickers, sma_windows, support_window, zz_pct, zz_min_bars, period, interval):
+    multi_df = download_data_multi(tickers, period=period, interval=interval)
+    if multi_df is None or multi_df.empty:
+        return pd.DataFrame()
+
+    features_list = []
+    if isinstance(multi_df.columns, pd.MultiIndex):
+        available = multi_df.columns.get_level_values(0).unique()
+        for ticker in tickers:
+            if ticker not in available:
+                continue
+            tdf = multi_df[ticker].dropna()
+            if tdf.empty:
+                continue
+            feats = get_latest_features_for_ticker(tdf, ticker, sma_windows, support_window, zz_pct, zz_min_bars)
+            if feats:
+                features_list.append(feats)
+    else:
+        feats = get_latest_features_for_ticker(multi_df.dropna(), tickers[0], sma_windows, support_window, zz_pct, zz_min_bars)
+        if feats:
+            features_list.append(feats)
+    return pd.DataFrame(features_list)
+
+# ---------------- RULE-BASED STRATEGY (+ Elliott) ----------------
+def predict_buy_sell_rule(df, rsi_buy=30, rsi_sell=70):
+    if df.empty:
+        return df
+    results = df.copy()
+
+    reversal_buy_core = (
+        (results["RSI"] < rsi_buy) &
+        (results.get("Bullish_Div", True)) &
+        (np.abs(results["Close"] - results.get("Support", results["Close"])) < 0.1 * results["Close"]) &
+        (results["Close"] > results["SMA20"])
+    )
+
+    trend_buy_core = (
+        (results["Close"] > results["SMA20"]) &
+        (results["SMA20"] > results["SMA50"]) &
+        (results["RSI"] > 40)
+    )
+
+    base_sell_core = (
+        ((results["RSI"] > rsi_sell) & (results.get("Bearish_Div", True))) |
+        (results["Close"] < results.get("Support", results["Close"])) |
+        ((results["SMA20"] < results["SMA50"]) & (results["SMA50"] < results["SMA200"]))
+    )
+
+    ew_bull = (results.get("Elliott_Bullish_Int", 0) == 1) | (results.get("Elliott_Phase_Code", 0) == 1)
+    ew_bear = (results.get("Elliott_Bearish_Int", 0) == 1) | (results.get("Elliott_Phase_Code", 0) == -1)
+
+    results["Reversal_Buy"] = reversal_buy_core | ew_bull
+    results["Trend_Buy"] = trend_buy_core | ew_bull
+
+    ew_only_buy = (
+        ew_bull &
+        (results["RSI"].between(35, 65)) &
+        (results["Close"] > results["SMA20"])
+    )
+
+    ew_only_sell = (
+        ew_bear &
+        (results["RSI"] > 50)
+    )
+
+    results["Sell_Point"] = results["Reversal_Buy"] | results["Trend_Buy"] | ew_only_buy
+    results["Buy_Point"] = base_sell_core | ew_only_sell
+
+    return results
+
+# ---------------- LABELS FOR ML ----------------
+def label_from_rule_based(df, rsi_buy=30, rsi_sell=70):
+    rules = predict_buy_sell_rule(df, rsi_buy=rsi_buy, rsi_sell=rsi_sell)
+    label = pd.Series(0, index=rules.index, dtype=int)
+    label[rules["Buy_Point"]] = 1
+    label[rules["Sell_Point"]] = -1
+    return label
+
+def label_from_future_returns(df, horizon=8, buy_thr=0.05, sell_thr=-0.05):
+    fut_ret = df["Close"].shift(-horizon) / df["Close"] - 1.0
+    label = pd.Series(0, index=df.index, dtype=int)
+    label[fut_ret >= buy_thr] = 1
+    label[fut_ret <= sell_thr] = -1
+    return label
+
+# ---------------- ML DATASET ----------------
+def build_ml_dataset_for_tickers(
+    tickers, sma_windows, support_window,
+    period, interval, min_rows,
+    label_mode="rule",
+    horizon=8, buy_thr=0.05, sell_thr=-0.05,
+    rsi_buy=30, rsi_sell=70,
+    zz_pct=0.05, zz_min_bars=5
+):
+    X_list, y_list, meta_list = [], [], []
+    feature_cols = None
+
+    for t in stqdm(tickers, desc="Preparing ML data"):
+        hist = load_history_for_ticker(t, period=period, interval=interval)
+        if hist is None or hist.empty or len(hist) < min_rows:
+            continue
+
+        feat = compute_features(hist, sma_windows, support_window, zz_pct, zz_min_bars)
+        if feat.empty:
+            continue
+
+        if label_mode == "rule":
+            y = label_from_rule_based(feat, rsi_buy=rsi_buy, rsi_sell=rsi_sell)
+        else:
+            y = label_from_future_returns(feat, horizon=horizon, buy_thr=buy_thr, sell_thr=sell_thr)
+
+        data = feat.join(y.rename("Label")).dropna()
+        if data.empty:
+            continue
+
+        drop_cols = set(["Label", "Support", "Bullish_Div", "Bearish_Div"])
+        use = data.select_dtypes(include=[np.number]).drop(columns=list(drop_cols & set(data.columns)), errors="ignore")
+
+        if feature_cols is None:
+            feature_cols = list(use.columns)
+
+        X_list.append(use[feature_cols])
+        y_list.append(data["Label"])
+        meta_list.append(pd.Series([t] * len(use), index=use.index, name="Ticker"))
+
+    if not X_list:
+        return pd.DataFrame(), pd.Series(dtype=int), [], []
+
+    X = pd.concat(X_list, axis=0)
+    y = pd.concat(y_list, axis=0)
+    tickers_series = pd.concat(meta_list, axis=0)
+    return X, y, feature_cols, tickers_series
+
+def train_rf_classifier(X, y, random_state=42):
+    if X.empty or y.empty:
+        return None, None, None
+    stratify_opt = y if len(np.unique(y)) > 1 else None
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, shuffle=True, stratify=stratify_opt, random_state=random_state
+        )
+    except Exception:
+        split_point = int(len(X) * 0.8)
+        X_train, X_test = X.iloc[:split_point], X.iloc[split_point:]
+        y_train, y_test = y.iloc[:split_point], y.iloc[split_point:]
+
+    clf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=6,
+        class_weight="balanced_subsample",
+        random_state=random_state,
+        n_jobs=-1
+    )
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, zero_division=0, output_dict=False)
+    return clf, acc, report
+
+def latest_feature_row_for_ticker(ticker, sma_windows, support_window, feature_cols, zz_pct, zz_min_bars, period, interval):
+    hist = load_history_for_ticker(ticker, period=period, interval=interval)
+    if hist is None or hist.empty:
+        return None
+    feat = compute_features(hist, sma_windows, support_window, zz_pct, zz_min_bars).dropna()
+    if feat.empty:
+        return None
+    use = feat.select_dtypes(include=[np.number])
+    row = use.iloc[-1:].copy()
+    for m in [c for c in feature_cols if c not in row.columns]:
+        row[m] = 0.0
+    row = row[feature_cols]
+    return row
+
+# ---------------- SIDEBAR ----------------
+with st.sidebar:
+    st.header("Settings")
+
+    timeframe_choice = st.selectbox("Timeframe", list(TIMEFRAME_CONFIG.keys()), index=2)
+    tf_conf = TIMEFRAME_CONFIG[timeframe_choice]
+
+    select_all = st.checkbox("Select all stocks", value=True)
+    default_list = NIFTY500_TICKERS if select_all else NIFTY500_TICKERS[:25]
+    selected_tickers = st.multiselect("Select stocks", NIFTY500_TICKERS, default=default_list)
+
+    sma_w1 = st.number_input(f"SMA Window 1 ({tf_conf['unit_label']})", 5, 250, tf_conf["default_sma"][0])
+    sma_w2 = st.number_input(f"SMA Window 2 ({tf_conf['unit_label']})", 5, 250, tf_conf["default_sma"][1])
+    sma_w3 = st.number_input(f"SMA Window 3 ({tf_conf['unit_label']})", 5, 250, tf_conf["default_sma"][2])
+    support_window = st.number_input(f"Support Period ({tf_conf['unit_label']})", 5, 500, tf_conf["support_default"])
+
+    st.markdown("---")
+    st.subheader("Elliott (ZigZag) Tuning")
+    zz_pct = st.slider("ZigZag reversal (%)", 2, 12, int(tf_conf["zz_pct_default"]*100), help="Sensitivity for swing detection.") / 100.0
+    zz_min_bars = st.slider(f"Min {tf_conf['unit_label']} between pivots", 3, 30, tf_conf["zz_min_bars_default"])
+
+    st.markdown("---")
+    label_mode = st.radio("ML Labeling Mode", ["Rule-based (teach the rules)", "Future Returns"], index=0)
+
+    if label_mode == "Rule-based (teach the rules)":
+        st.subheader("Rule thresholds (also used to generate ML labels)")
+        rsi_buy_lbl = st.slider("RSI Buy Threshold", 5, 50, tf_conf["rsi_buy_default"])
+        rsi_sell_lbl = st.slider("RSI Sell Threshold", 50, 95, tf_conf["rsi_sell_default"])
+        rsi_buy = rsi_buy_lbl
+        rsi_sell = rsi_sell_lbl
+        ml_horizon = tf_conf["ml_horizon_default"]
+        ml_buy_thr = tf_conf["ml_buy_thr_default"]
+        ml_sell_thr = tf_conf["ml_sell_thr_default"]
+    else:
+        st.subheader("Rule thresholds (for live rule signals only)")
+        rsi_buy = st.slider("RSI Buy Threshold", 5, 50, tf_conf["rsi_buy_default"])
+        rsi_sell = st.slider("RSI Sell Threshold", 50, 95, tf_conf["rsi_sell_default"])
+        st.subheader("ML labeling (future return)")
+        ml_horizon = st.number_input("Horizon (bars ahead)", 1, 500, tf_conf["ml_horizon_default"])
+        ml_buy_thr = st.number_input("Buy threshold (e.g., 0.05 = +5%)", 0.01, 0.50, tf_conf["ml_buy_thr_default"], step=0.01, format="%.2f")
+        ml_sell_thr = st.number_input("Sell threshold (e.g., -0.05 = -5%)", -0.50, -0.01, tf_conf["ml_sell_thr_default"], step=0.01, format="%.2f")
+
+    if st.button(f"Run {timeframe_choice} Analysis"):
+        st.session_state.analysis_run = True
+
+# ---------------- MAIN ----------------
+if st.session_state.analysis_run:
+    sma_tuple = (sma_w1, sma_w2, sma_w3)
+
+    period = tf_conf["period"]
+    interval = tf_conf["interval"]
+
+    with st.spinner(f"Fetching {interval} data & computing rule-based + Elliott features..."):
+        feats = get_features_for_all(selected_tickers, sma_tuple, support_window, zz_pct, zz_min_bars, period, interval)
+        if feats is None or feats.empty:
+            st.error("No valid data for selected tickers.")
+        else:
+            preds_rule = predict_buy_sell_rule(feats, rsi_buy, rsi_sell)
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "✅ Rule Buy (current snapshot)",
+        "❌ Rule Sell (current snapshot)",
+        "📈 Chart",
+        "🤖 ML Signals"
+    ])
+
+    with tab1:
+        if 'preds_rule' not in locals() or preds_rule.empty:
+            st.info("No rule-based buy signals.")
+        else:
+            df_buy = preds_rule[preds_rule["Buy_Point"]].copy()
+            df_buy["TradingView"] = df_buy["Ticker"].apply(
+                lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
+            )
+            show_cols = ["Ticker","TradingView","Close","RSI","Reversal_Buy","Trend_Buy"]
+            cols = [c for c in show_cols if c in df_buy.columns] + [c for c in df_buy.columns if c not in show_cols]
+            st.write(df_buy[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
+
+    with tab2:
+        if 'preds_rule' not in locals() or preds_rule.empty:
+            st.info("No rule-based sell signals.")
+        else:
+            df_sell = preds_rule[preds_rule["Sell_Point"]].copy()
+            df_sell["TradingView"] = df_sell["Ticker"].apply(
+                lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
+            )
+            show_cols = ["Ticker","TradingView","Close","RSI"]
+            cols = [c for c in show_cols if c in df_sell.columns] + [c for c in df_sell.columns if c not in show_cols]
+            st.write(df_sell[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
+
+    with tab3:
+        ticker_for_chart = st.selectbox("Chart Ticker", selected_tickers)
+        chart_df = yf.download(ticker_for_chart, period=tf_conf["chart_period"], interval=interval, progress=False, threads=True)
+        if not chart_df.empty:
+            chart_df = compute_features(chart_df, sma_tuple, support_window, zz_pct, zz_min_bars).dropna()
+            if not chart_df.empty:
+                st.line_chart(chart_df[["Close", f"SMA{sma_w1}", f"SMA{sma_w2}", f"SMA{sma_w3}"]])
+                st.line_chart(chart_df[["RSI"]])
+
+                latest = chart_df.iloc[-1]
+                phase_code = int(latest.get("Elliott_Phase_Code", 0))
+                phase_text = {1:"ImpulseUp", -1:"ImpulseDown", 2:"CorrectionUp", -2:"CorrectionDown", 0:"Unknown"}.get(phase_code, "Unknown")
+                wave_no = int(latest.get("Elliott_Wave_No", 0))
+                st.caption(
+                    f"🌀 Elliott Phase: **{phase_text}** |  Wave#: **{wave_no}** |  "
+                    f"ZigZag: {zz_pct*100:.1f}% / {zz_min_bars} {tf_conf['unit_label']}"
+                )
+        else:
+            st.warning("No chart data available.")
+
+    with tab4:
+        if not SKLEARN_OK:
+            st.error("scikit-learn not available. Install with: pip install scikit-learn")
+        else:
+            with st.spinner(f"Building ML dataset & training model on {timeframe_choice} data..."):
+                if label_mode == "Rule-based (teach the rules)":
+                    X, y, feature_cols, tickers_series = build_ml_dataset_for_tickers(
+                        selected_tickers, sma_tuple, support_window,
+                        period=period, interval=interval, min_rows=tf_conf["min_rows"],
+                        label_mode="rule", rsi_buy=rsi_buy, rsi_sell=rsi_sell,
+                        zz_pct=zz_pct, zz_min_bars=zz_min_bars
+                    )
+                else:
+                    X, y, feature_cols, tickers_series = build_ml_dataset_for_tickers(
+                        selected_tickers, sma_tuple, support_window,
+                        period=period, interval=interval, min_rows=tf_conf["min_rows"],
+                        label_mode="future", horizon=ml_horizon, buy_thr=ml_buy_thr, sell_thr=ml_sell_thr,
+                        zz_pct=zz_pct, zz_min_bars=zz_min_bars
+                    )
+
+                if X.empty or y.empty:
+                    st.warning("Not enough historical data to train the ML model for the chosen settings.")
+                else:
+                    clf, acc, report = train_rf_classifier(X, y)
+                    st.caption(f"Validation accuracy (holdout): **{acc:.3f}**")
+                    with st.expander("Classification report"):
+                        st.text(report)
+
+                    rows = []
+                    for t in stqdm(selected_tickers, desc="Scoring", total=len(selected_tickers)):
+                        row = latest_feature_row_for_ticker(
+                            t, sma_tuple, support_window, feature_cols, zz_pct, zz_min_bars,
+                            period=period, interval=interval
+                        )
+                        if row is None:
+                            continue
+                        proba = clf.predict_proba(row)[0] if hasattr(clf, "predict_proba") else None
+                        pred = clf.predict(row)
+                        rows.append({
+                            "Ticker": t,
+                            "ML_Pred": {1: "BUY", 0: "HOLD", -1: "SELL"}.get(int(pred), "HOLD"),
+                            "Prob_Buy": float(proba[list(clf.classes_).index(1)]) if proba is not None and 1 in clf.classes_ else np.nan,
+                            "Prob_Hold": float(proba[list(clf.classes_).index(0)]) if proba is not None and 0 in clf.classes_ else np.nan,
+                            "Prob_Sell": float(proba[list(clf.classes_).index(-1)]) if proba is not None and -1 in clf.classes_ else np.nan,
+                        })
+                    ml_df = pd.DataFrame(rows).sort_values(["ML_Pred", "Prob_Buy"], ascending=[True, False])
+
+                    def tradingview_link(ticker):
+                        return f"https://in.tradingview.com/chart/?symbol=NSE%3A{ticker.replace('.NS','')}"
+                    ml_df["TradingView"] = ml_df["Ticker"].apply(tradingview_link)
+
+                    st.dataframe(
+                        ml_df,
+                        use_container_width=True,
+                        column_config={
+                            "TradingView": st.column_config.LinkColumn(
+                                "TradingView",
+                                display_text="📈 Chart"
+                            )
+                        }
+                    )
+
+    # --- DOWNLOADS ---
+    if 'ml_df' in locals() and 'feats' in locals() and not feats.empty:
+        price_data = feats[['Ticker', 'Close']].copy()
+        download_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
+        download_df = download_df.rename(columns={
+            'Prob_Buy': 'Prob_Buy',
+            'Prob_Sell': 'Prob_Sell',
+            'Prob_Hold': 'Prob_Hold',
+            'Close': 'Closing_Price'
+        })
+        output_columns = ['Ticker', 'Closing_Price', 'ML_Pred', 'Prob_Buy', 'Prob_Sell', 'Prob_Hold']
+        final_df_for_download = download_df[output_columns]
+
+        st.download_button(
+            label=f"📥 Download ML Signals as CSV ({timeframe_choice})",
+            data=final_df_for_download.to_csv(index=False).encode('utf-8'),
+            file_name=f'ml_signals_with_price_{interval}.csv',
+            mime='text/csv',
+        )
+
+    if 'preds_rule' in locals() and preds_rule is not None and not preds_rule.empty:
+        st.download_button(
+            f"📥 Download Rule-based Results (snapshot, {timeframe_choice})",
+            preds_rule.to_csv(index=False).encode(),
+            f'nifty500_rule_signals_{interval}.csv',
+            "text/csv",
+        )
+
+st.markdown("---")
+st.markdown("⚠ Educational use only — not financial advice.")
