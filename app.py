@@ -609,43 +609,14 @@ if st.session_state.analysis_run:
         else:
             preds_rule = predict_buy_sell_rule(feats, rsi_buy, rsi_sell)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "✅ Rule Buy (current snapshot)",
-        "❌ Rule Sell (current snapshot)",
+    # Only 2 tabs now: Chart + ML
+    tab_chart, tab_ml = st.tabs([
         "📈 Chart",
         "🤖 ML Signals"
     ])
 
-    # --------- TAB 1: RULE BUY -------------
-    with tab1:
-        if 'preds_rule' not in locals() or preds_rule.empty:
-            st.info("No rule-based buy signals.")
-        else:
-            df_buy = preds_rule[preds_rule["Buy_Point"]].copy()
-            df_buy["TradingView"] = df_buy["Ticker"].apply(
-                lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
-            )
-            # Show current price with ticker
-            show_cols = ["Ticker", "Close", "TradingView", "RSI", "Reversal_Buy", "Trend_Buy"]
-            cols = [c for c in show_cols if c in df_buy.columns] + [c for c in df_buy.columns if c not in show_cols]
-            st.write(df_buy[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # --------- TAB 2: RULE SELL -------------
-    with tab2:
-        if 'preds_rule' not in locals() or preds_rule.empty:
-            st.info("No rule-based sell signals.")
-        else:
-            df_sell = preds_rule[preds_rule["Sell_Point"]].copy()
-            df_sell["TradingView"] = df_sell["Ticker"].apply(
-                lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
-            )
-            # Show current price with ticker
-            show_cols = ["Ticker", "Close", "TradingView", "RSI"]
-            cols = [c for c in show_cols if c in df_sell.columns] + [c for c in df_sell.columns if c not in show_cols]
-            st.write(df_sell[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # --------- TAB 3: CHART -------------
-    with tab3:
+    # --------- CHART TAB -------------
+    with tab_chart:
         ticker_for_chart = st.selectbox("Chart Ticker", selected_tickers)
         chart_df = yf.download(ticker_for_chart, period=tf_conf["chart_period"], interval=interval, progress=False, threads=True)
         if not chart_df.empty:
@@ -665,8 +636,8 @@ if st.session_state.analysis_run:
         else:
             st.warning("No chart data available.")
 
-    # --------- TAB 4: ML -------------
-    with tab4:
+    # --------- ML TAB -------------
+    with tab_ml:
         if not SKLEARN_OK:
             st.error("scikit-learn not available. Install with: pip install scikit-learn")
         else:
@@ -718,7 +689,6 @@ if st.session_state.analysis_run:
                         if 'Ticker' in feats.columns and 'Close' in feats.columns:
                             price_data = feats[['Ticker', 'Close']].drop_duplicates(subset=['Ticker'])
                             ml_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
-                            # Reorder to show Ticker + Close first
                             cols = ["Ticker", "Close"] + [c for c in ml_df.columns if c not in ["Ticker", "Close"]]
                             ml_df = ml_df[cols]
 
