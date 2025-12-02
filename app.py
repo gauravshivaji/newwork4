@@ -1,4 +1,4 @@
-import streamlit as st 
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -33,7 +33,7 @@ TIMEFRAME_CONFIG = {
         "zz_min_bars_default": 8,
         "rsi_buy_default": 30,
         "rsi_sell_default": 70,
-        "ml_horizon_default": 24,    # 1 day of trading hours
+        "ml_horizon_default": 24,    # ~1 day of trading hours
         "ml_buy_thr_default": 0.03,
         "ml_sell_thr_default": -0.03,
         "min_rows": 500,
@@ -74,7 +74,6 @@ TIMEFRAME_CONFIG = {
 
 # ---------------- TICKERS ----------------
 NIFTY500_TICKERS = [
-    
     "360ONE.NS","3MINDIA.NS","ABB.NS","TIPSMUSIC.NS","ACC.NS","ACMESOLAR.NS","AIAENG.NS","APLAPOLLO.NS","AUBANK.NS","AWL.NS","AADHARHFC.NS",
     "AARTIIND.NS","AAVAS.NS","ABBOTINDIA.NS","ACE.NS","ADANIENSOL.NS","ADANIENT.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS","ATGL.NS",
     "ABCAPITAL.NS","ABFRL.NS","ABREL.NS","ABSLAMC.NS","AEGISLOG.NS","AFCONS.NS","AFFLE.NS","AJANTPHARM.NS","AKUMS.NS","APLLTD.NS",
@@ -442,6 +441,7 @@ def predict_buy_sell_rule(df, rsi_buy=30, rsi_sell=70):
         (results["RSI"] > 50)
     )
 
+    # NOTE: Logic is inverted vs naming in your older code, but kept same as you had
     results["Sell_Point"] = results["Reversal_Buy"] | results["Trend_Buy"] | ew_only_buy
     results["Buy_Point"] = base_sell_core | ew_only_sell
 
@@ -616,6 +616,7 @@ if st.session_state.analysis_run:
         "🤖 ML Signals"
     ])
 
+    # --------- TAB 1: RULE BUY -------------
     with tab1:
         if 'preds_rule' not in locals() or preds_rule.empty:
             st.info("No rule-based buy signals.")
@@ -624,10 +625,12 @@ if st.session_state.analysis_run:
             df_buy["TradingView"] = df_buy["Ticker"].apply(
                 lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
             )
-            show_cols = ["Ticker","TradingView","Close","RSI","Reversal_Buy","Trend_Buy"]
+            # Show current price with ticker
+            show_cols = ["Ticker", "Close", "TradingView", "RSI", "Reversal_Buy", "Trend_Buy"]
             cols = [c for c in show_cols if c in df_buy.columns] + [c for c in df_buy.columns if c not in show_cols]
             st.write(df_buy[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
 
+    # --------- TAB 2: RULE SELL -------------
     with tab2:
         if 'preds_rule' not in locals() or preds_rule.empty:
             st.info("No rule-based sell signals.")
@@ -636,10 +639,12 @@ if st.session_state.analysis_run:
             df_sell["TradingView"] = df_sell["Ticker"].apply(
                 lambda x: f'<a href="https://in.tradingview.com/chart/?symbol=NSE%3A{x.replace(".NS","")}" target="_blank">📈 Chart</a>'
             )
-            show_cols = ["Ticker","TradingView","Close","RSI"]
+            # Show current price with ticker
+            show_cols = ["Ticker", "Close", "TradingView", "RSI"]
             cols = [c for c in show_cols if c in df_sell.columns] + [c for c in df_sell.columns if c not in show_cols]
             st.write(df_sell[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
 
+    # --------- TAB 3: CHART -------------
     with tab3:
         ticker_for_chart = st.selectbox("Chart Ticker", selected_tickers)
         chart_df = yf.download(ticker_for_chart, period=tf_conf["chart_period"], interval=interval, progress=False, threads=True)
@@ -660,6 +665,7 @@ if st.session_state.analysis_run:
         else:
             st.warning("No chart data available.")
 
+    # --------- TAB 4: ML -------------
     with tab4:
         if not SKLEARN_OK:
             st.error("scikit-learn not available. Install with: pip install scikit-learn")
@@ -707,18 +713,19 @@ if st.session_state.analysis_run:
                         })
                     ml_df = pd.DataFrame(rows).sort_values(["ML_Pred", "Prob_Buy"], ascending=[True, False])
 
+                    # ---- Add current price to ML table (from feats) ----
+                    if 'feats' in locals() and isinstance(feats, pd.DataFrame) and not feats.empty:
+                        if 'Ticker' in feats.columns and 'Close' in feats.columns:
+                            price_data = feats[['Ticker', 'Close']].drop_duplicates(subset=['Ticker'])
+                            ml_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
+                            # Reorder to show Ticker + Close first
+                            cols = ["Ticker", "Close"] + [c for c in ml_df.columns if c not in ["Ticker", "Close"]]
+                            ml_df = ml_df[cols]
+
                     def tradingview_link(ticker):
                         return f"https://in.tradingview.com/chart/?symbol=NSE%3A{ticker.replace('.NS','')}"
                     ml_df["TradingView"] = ml_df["Ticker"].apply(tradingview_link)
-                    # merge current price
-                    price_data = feats[['Ticker','Close']]
-                    ml_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
 
-# move price column after ticker
-                    cols = ["Ticker","Close"] + [col for col in ml_df.columns if col not in ["Ticker","Close"]]
-                    ml_df = ml_df[cols]
-
-                    
                     st.dataframe(
                         ml_df,
                         use_container_width=True,
@@ -731,16 +738,33 @@ if st.session_state.analysis_run:
                     )
 
     # --- DOWNLOADS ---
-    if 'ml_df' in locals() and 'feats' in locals() and not feats.empty:
-        price_data = feats[['Ticker', 'Close']].copy()
+    if (
+        'ml_df' in locals()
+        and isinstance(ml_df, pd.DataFrame)
+        and not ml_df.empty
+        and 'feats' in locals()
+        and isinstance(feats, pd.DataFrame)
+        and not feats.empty
+    ):
+        # Price data
+        if 'Ticker' in feats.columns and 'Close' in feats.columns:
+            price_data = feats[['Ticker', 'Close']].drop_duplicates(subset=['Ticker'])
+        else:
+            price_data = pd.DataFrame(columns=['Ticker', 'Close'])
+
         download_df = pd.merge(ml_df, price_data, on='Ticker', how='left')
-        download_df = download_df.rename(columns={
-            'Prob_Buy': 'Prob_Buy',
-            'Prob_Sell': 'Prob_Sell',
-            'Prob_Hold': 'Prob_Hold',
-            'Close': 'Closing_Price'
-        })
+
+        # If Close exists, rename to Closing_Price
+        if 'Close' in download_df.columns:
+            download_df = download_df.rename(columns={'Close': 'Closing_Price'})
+
         output_columns = ['Ticker', 'Closing_Price', 'ML_Pred', 'Prob_Buy', 'Prob_Sell', 'Prob_Hold']
+
+        # Ensure all needed columns exist
+        for col in output_columns:
+            if col not in download_df.columns:
+                download_df[col] = np.nan
+
         final_df_for_download = download_df[output_columns]
 
         st.download_button(
@@ -754,7 +778,7 @@ if st.session_state.analysis_run:
         st.download_button(
             f"📥 Download Rule-based Results (snapshot, {timeframe_choice})",
             preds_rule.to_csv(index=False).encode(),
-            f'nifty500_rule_signals_{interval}.csv',
+            f'nifty500_rule_signals_{interval}.csv",
             "text/csv",
         )
 
